@@ -153,6 +153,45 @@ def read_points3D_binary(path_to_model_file):
             errors[p_id] = error
     return xyzs, rgbs, errors
 
+def read_points3D_binary_with_tracks(path_to_model_file):
+    """Like read_points3D_binary but also returns track info.
+
+    Returns:
+        xyzs: (N,3) float64
+        rgbs: (N,3) uint8
+        errors: (N,1) float64
+        point_ids: list of int, the COLMAP point3D ID for each row
+        track_image_ids: list of list[int], image_ids observing each point
+    """
+    with open(path_to_model_file, "rb") as fid:
+        num_points = read_next_bytes(fid, 8, "Q")[0]
+
+        xyzs = np.empty((num_points, 3))
+        rgbs = np.empty((num_points, 3))
+        errors = np.empty((num_points, 1))
+        point_ids = []
+        track_image_ids = []
+
+        for p_id in range(num_points):
+            binary_point_line_properties = read_next_bytes(
+                fid, num_bytes=43, format_char_sequence="QdddBBBd")
+            pid = binary_point_line_properties[0]
+            xyz = np.array(binary_point_line_properties[1:4])
+            rgb = np.array(binary_point_line_properties[4:7])
+            error = np.array(binary_point_line_properties[7])
+            track_length = read_next_bytes(
+                fid, num_bytes=8, format_char_sequence="Q")[0]
+            track_elems = read_next_bytes(
+                fid, num_bytes=8*track_length,
+                format_char_sequence="ii"*track_length)
+            image_ids_for_point = [track_elems[i*2] for i in range(track_length)]
+            xyzs[p_id] = xyz
+            rgbs[p_id] = rgb
+            errors[p_id] = error
+            point_ids.append(pid)
+            track_image_ids.append(image_ids_for_point)
+    return xyzs, rgbs, errors, point_ids, track_image_ids
+
 def read_intrinsics_text(path):
     """
     Taken from https://github.com/colmap/colmap/blob/dev/scripts/python/read_write_model.py
