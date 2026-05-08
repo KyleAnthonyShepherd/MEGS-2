@@ -653,13 +653,13 @@ def train_window(
 
                     if (phase_iter > optimizing_spa_start_iter
                             and phase_iter % training_cfg.optimizing_spa_interval == 0):
-                        if phase_iter <= optimizing_spa_stop_iter:
+                        if phase_iter <= optimizing_spa_stop_iter and optimizingSpa is not None:
                             imp_score = update_imp_score(
                                 prog_scene.train_cameras, gaussians, pipe, background,
                                 imp_metric=training_cfg.imp_metric,
                             )
                             optimizingSpa.update(imp_score)
-                        if phase_iter <= optimizing_spa_sg_stop_iter:
+                        if phase_iter <= optimizing_spa_sg_stop_iter and optimizingSpaSg is not None:
                             imp_sg_score = update_sg_color_diff(gaussians)
                             optimizingSpaSg.update(imp_sg_score)
 
