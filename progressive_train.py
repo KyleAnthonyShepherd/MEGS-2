@@ -684,6 +684,8 @@ def train_window(
                     gaussians.max_sg_degree = gaussians.max_sg_degree
                     gaussians.reinitial_pts(gaussians._xyz, SH2RGB(gaussians._rgb_base))
                     gaussians.training_setup(opt)
+                    optimizingSpa = None
+                    optimizingSpaSg = None
                     torch.cuda.empty_cache()
                     viewpoint_stack = None
 
@@ -703,6 +705,8 @@ def train_window(
                     logger.info(f"[final] Before 2nd prune: {gaussians.get_opacity.shape[0]}")
                     gaussians.prune_points(prune_mask)
                     logger.info(f"[final] After 2nd prune: {gaussians.get_opacity.shape[0]}")
+                    optimizingSpa = None
+                    optimizingSpaSg = None
                     torch.cuda.empty_cache()
 
                 # SG axis culling
