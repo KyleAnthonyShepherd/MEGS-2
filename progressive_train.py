@@ -783,6 +783,14 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
     gaussians.create_from_pcd(prog_scene.current_basic_pcd, prog_scene.cameras_extent)
     gaussians.training_setup(opt)
 
+    # Dense init for the initial snapshot (same logic as merge phase)
+    if config.dense_init.enabled and new_cams:
+        logger.info(f"[dense_init] Running on initial {len(new_cams)} cameras ...")
+        dense_init_for_new_images(
+            gaussians, prog_scene, new_cams,
+            config.dense_init, opt, current_iter=0,
+        )
+
     bg_white = getattr(dataset, 'white_background', False)
     global_iter = 0
     global_iter += train_window(
