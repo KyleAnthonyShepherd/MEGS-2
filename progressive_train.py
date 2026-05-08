@@ -395,7 +395,9 @@ def dense_init_for_new_images(
 # Save checkpoint
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model_path: str, gaussians: SphericalGaussianModel, tag):
+def save_checkpoint(model_path: str, gaussians: SphericalGaussianModel, snapshot_idx=None, tag=None):
+    if tag is None:
+        tag = snapshot_idx
     point_cloud_path = os.path.join(model_path, f"point_cloud/iteration_{tag}")
     os.makedirs(point_cloud_path, exist_ok=True)
     gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
