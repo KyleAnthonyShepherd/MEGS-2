@@ -1,0 +1,53 @@
+# Progressive MEGS² training configuration
+# All tunables live here; CLI args are paths + debug flags only.
+
+training:
+  iter_initial: 3000          # iterations on snapshot 0 before progressive loop
+  iter_per_merge: 200         # iterations per new image in a merge phase
+  iter_final: 4000            # final refinement iterations
+  num_max: 800000             # Gaussian count ceiling for 6 GB GPU
+  prune_every_n_snapshots: 5  # lightweight prune interval during merge phases
+
+  # MEGS-2 pruning schedule (applied to final-refinement phase, scaled to iter_final)
+  simp_iteration1_frac: 0.40           # → simp_iteration1 = iter_final * frac
+  optimizing_spa_start_iter_frac: 0.50
+  optimizing_spa_stop_iter_frac: 0.80
+  optimizing_spa_sg_stop_iter_frac: 0.95
+  prune_ratio1: 0.05
+  prune_ratio2: 0.05
+  sharpness_threshold: 1.0
+  optimizing_spa_interval: 100
+
+  # Merge-phase densification interval (slower than initial; protect recently added Gaussians)
+  merge_densification_interval: 100
+
+  # Importance metric: "outdoor" or "indoor" (passed to update_imp_score)
+  imp_metric: outdoor
+
+dense_init:
+  enabled: true
+  skip_first_n_snapshots: 3           # let SfM stabilise before trusting alignment
+
+  min_sfm_points_for_alignment: 10    # below this, skip dense init for this image
+  min_sfm_depth_range_fraction: 0.10  # SfM depths must span >=10% of scene scale
+  target_dense_points_per_image: 50000
+  novelty_distance_threshold: 0.01    # in units of cameras_extent
+  depth_disagreement_threshold: 0.10  # fraction of scene scale
+  max_rejected_fraction: 0.5
+  grace_iters: 200                    # protect dense Gaussians from pruning this long
+
+  dav2:
+    model_size: small                 # small | base | large
+    input_resolution: 518
+    device: cuda
+    fp16: true
+
+  ransac:
+    iterations: 200
+    inlier_threshold: 0.05
+    min_inliers: 8
+
+snapshots:
+  source_path_dir: null               # override via --source_path_dir
+  snapshot_skip: 1                    # process every Nth snapshot
+  progressive_output: true            # save per-snapshot .ply checkpoints

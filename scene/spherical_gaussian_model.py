@@ -867,3 +867,89 @@ class SphericalGaussianModel:
         self._initialize_spherical_gaussians_unified(fused_point_cloud.shape[0])
         self._sg_axis_count = torch.full((fused_point_cloud.shape[0],), self.max_sg_degree, device="cuda", dtype=torch.int)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def expand_from_pcd(self, pcd: BasicPointCloud, mask: np.ndarray, spatial_lr_scale: float):
+        """Append fresh Gaussians for points selected by boolean mask over pcd.points."""
+        new_xyz = torch.from_numpy(pcd.points[mask]).float().cuda()
+        new_rgb = torch.from_numpy(pcd.colors[mask]).float().cuda()
+        n_new = new_xyz.shape[0]
+        if n_new == 0:
+            return
+
+        new_rgb_sh = RGB2SH(new_rgb)
+        dist2 = torch.clamp_min(distCUDA2(new_xyz), 0.0000001)
+        new_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        new_rotation = torch.zeros((n_new, 4), device="cuda")
+        new_rotation[:, 0] = 1.0
+        new_opacity = inverse_sigmoid(0.1 * torch.ones((n_new, 1), dtype=torch.float, device="cuda"))
+
+        new_sg_directions = None
+        new_sg_sharpness = None
+        new_sg_rgb = None
+        new_sg_axis_count = None
+        if self.max_sg_degree > 0:
+            dirs = torch.randn((n_new, self.max_sg_degree, 3), device="cuda")
+            dirs = dirs / (torch.norm(dirs, dim=2, keepdim=True) + 1e-8)
+            new_sg_directions = dirs
+            new_sg_sharpness = torch.ones((n_new, self.max_sg_degree, 1), device="cuda") * 0.1
+            new_sg_rgb = torch.randn((n_new, self.max_sg_degree, 3), device="cuda") * 0.1
+            new_sg_axis_count = torch.full((n_new,), self.max_sg_degree, device="cuda", dtype=torch.int)
+
+        d = {
+            "xyz": new_xyz,
+            "rgb_base": new_rgb_sh,
+            "opacity": new_opacity,
+            "scaling": new_scaling,
+            "rotation": new_rotation,
+        }
+        if self.max_sg_degree > 0:
+            d["sg_directions"] = new_sg_directions
+            d["sg_sharpness"] = new_sg_sharpness
+            d["sg_rgb"] = new_sg_rgb
+
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        self._xyz = optimizable_tensors["xyz"]
+        self._rgb_base = optimizable_tensors["rgb_base"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+        self._opacity = optimizable_tensors["opacity"]
+        if self.max_sg_degree > 0:
+            self._sg_directions = optimizable_tensors["sg_directions"]
+            self._sg_sharpness = optimizable_tensors["sg_sharpness"]
+            self._sg_rgb = optimizable_tensors["sg_rgb"]
+            self._sg_axis_count = torch.cat((self._sg_axis_count, new_sg_axis_count), dim=0)
+
+        n_total = self._xyz.shape[0]
+        self.xyz_gradient_accum = torch.cat(
+            (self.xyz_gradient_accum, torch.zeros((n_new, 1), device="cuda")), dim=0)
+        self.denom = torch.cat(
+            (self.denom, torch.zeros((n_new, 1), device="cuda")), dim=0)
+        self.max_radii2D = torch.cat(
+            (self.max_radii2D, torch.zeros(n_new, device="cuda")), dim=0)
+
+    # Grace-period tracking for freshly inserted Gaussians (prevents pruning before training).
+    # Format: list of (start_idx, end_idx_exclusive, expires_at_iter)
+    _grace_records: list = []
+
+    def mark_recently_added(self, idx_range: slice, iteration: int, grace_iters: int):
+        if not hasattr(self, '_grace_records'):
+            self._grace_records = []
+        start = idx_range.start if idx_range.start is not None else 0
+        stop = idx_range.stop if idx_range.stop is not None else self._xyz.shape[0]
+        self._grace_records.append((start, stop, iteration + grace_iters))
+
+    def get_grace_protected_mask(self, current_iter: int) -> torch.Tensor:
+        n = self._xyz.shape[0]
+        mask = torch.zeros(n, dtype=torch.bool, device="cuda")
+        if not hasattr(self, '_grace_records'):
+            return mask
+        active = []
+        for record in self._grace_records:
+            start, stop, expires = record
+            if current_iter < expires:
+                stop = min(stop, n)
+                if start < stop:
+                    mask[start:stop] = True
+                active.append(record)
+        self._grace_records = active
+        return mask
