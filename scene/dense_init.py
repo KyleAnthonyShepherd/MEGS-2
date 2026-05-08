@@ -21,8 +21,14 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
-import torch
 from scipy.spatial import cKDTree
+
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +111,7 @@ class DepthAnythingV2Wrapper:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    @torch.no_grad()
-    def predict(self, image_chw: torch.Tensor) -> torch.Tensor:
+    def predict(self, image_chw) -> "torch.Tensor":
         """Predict depth-like map.
 
         Args:
@@ -115,6 +120,7 @@ class DepthAnythingV2Wrapper:
         Returns:
             (H, W) float32 tensor on CPU — DAv2 raw output (relative disparity).
         """
+        import torch as _torch
         from PIL import Image as PILImage
         img_np = (image_chw.cpu().float().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         pil_img = PILImage.fromarray(img_np)
@@ -122,15 +128,16 @@ class DepthAnythingV2Wrapper:
         inputs = self.processor(images=pil_img, return_tensors="pt")
         inputs = {k: v.to(self.cfg.device) for k, v in inputs.items()}
         if self.cfg.fp16:
-            inputs = {k: v.half() if v.dtype == torch.float32 else v
+            inputs = {k: v.half() if v.dtype == _torch.float32 else v
                       for k, v in inputs.items()}
 
-        outputs = self.model(**inputs)
+        with _torch.no_grad():
+            outputs = self.model(**inputs)
         # predicted_depth shape: (1, H', W')
         depth = outputs.predicted_depth  # relative disparity
         # Resize back to original image size
         H_orig, W_orig = image_chw.shape[1], image_chw.shape[2]
-        depth = torch.nn.functional.interpolate(
+        depth = _torch.nn.functional.interpolate(
             depth.unsqueeze(1).float(),
             size=(H_orig, W_orig),
             mode="bilinear",
@@ -197,7 +204,7 @@ def transform_to_camera_frame(xyz_world: np.ndarray, camera) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def align_depth_to_sfm(
-    depth_map: torch.Tensor,          # (H, W) DAv2 raw output, CPU float32
+    depth_map,  # torch.Tensor          # (H, W) DAv2 raw output, CPU float32
     camera,                           # MEGS-2 Camera
     sfm_xyz_visible: np.ndarray,      # (N, 3) SfM points visible in camera
     cfg: RansacConfig,
@@ -275,14 +282,14 @@ def align_depth_to_sfm(
 # ---------------------------------------------------------------------------
 
 def depth_to_points(
-    depth_map: torch.Tensor,          # (H, W) DAv2 raw output, CPU float32
+    depth_map,  # torch.Tensor          # (H, W) DAv2 raw output, CPU float32
     camera,
     a: float,
     b: float,
     target_n_points: int,
     sanity_threshold: float,          # absolute depth units
     sfm_xyz_visible: np.ndarray,      # (N, 3) for sanity filter
-    image_rgb: torch.Tensor,          # (3, H, W) in [0, 1], CPU or CUDA
+    image_rgb,  # torch.Tensor (3, H, W)          # (3, H, W) in [0, 1], CPU or CUDA
     max_rejected_fraction: float,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     """Back-project aligned depth map to world-space points with sanity filter.

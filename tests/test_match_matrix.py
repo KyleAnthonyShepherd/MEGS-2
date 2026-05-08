@@ -1,15 +1,22 @@
 """Tests for scene/match_matrix.py."""
 
+import importlib.util
 import os
+import sys
 import tempfile
+
 import numpy as np
 import pytest
 
-# Allow running from repo root
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from scene.match_matrix import parse_match_matrix, compute_image_weights
+# Import match_matrix directly to avoid triggering scene/__init__.py (which needs torch)
+_spec = importlib.util.spec_from_file_location(
+    "match_matrix",
+    os.path.join(os.path.dirname(__file__), "..", "scene", "match_matrix.py"),
+)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+parse_match_matrix = _mod.parse_match_matrix
+compute_image_weights = _mod.compute_image_weights
 
 
 def _write_files(tmpdir, matrix_rows, names):

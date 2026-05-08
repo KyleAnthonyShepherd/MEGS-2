@@ -417,6 +417,7 @@ def train_window(
     new_cam_indices: Optional[List[int]] = None,
     global_iter_start: int = 0,
     diary_file=None,
+    bg_white: bool = False,
 ):
     """Run `n_iters` training iterations for the given phase.
 
@@ -424,7 +425,7 @@ def train_window(
     """
     training_cfg = config.training
 
-    bg_color = [1, 1, 1] if getattr(opt, 'white_background', False) else [0, 0, 0]
+    bg_color = [1, 1, 1] if bg_white else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     # Phase-specific derived thresholds (for final phase only)
@@ -776,6 +777,7 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
     gaussians.create_from_pcd(prog_scene.current_basic_pcd, prog_scene.cameras_extent)
     gaussians.training_setup(opt)
 
+    bg_white = getattr(dataset, 'white_background', False)
     global_iter = 0
     global_iter += train_window(
         gaussians, prog_scene, opt, pipe, config,
@@ -783,6 +785,7 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
         phase="initial",
         global_iter_start=global_iter,
         diary_file=diary_file,
+        bg_white=bg_white,
     )
 
     if config.snapshots.progressive_output:
@@ -848,6 +851,7 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
             new_cam_indices=new_cam_indices,
             global_iter_start=global_iter,
             diary_file=diary_file,
+            bg_white=bg_white,
         )
 
         # Phase 7: lightweight prune every N snapshots
@@ -868,6 +872,7 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
         phase="final",
         global_iter_start=global_iter,
         diary_file=diary_file,
+        bg_white=bg_white,
     )
 
     save_checkpoint(model_path, gaussians, snapshot_idx="final")

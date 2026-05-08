@@ -1,19 +1,29 @@
 """Tests for scene/dense_init.py covering Phase 5 acceptance criteria."""
 
+import importlib.util
 import math
 import os
 import sys
 
 import numpy as np
 import pytest
-import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# torch is required for all tests in this file
+torch = pytest.importorskip("torch")
 
-from scene.dense_init import (
-    AlignmentFailed, AlignmentResult, RansacConfig,
-    align_depth_to_sfm, depth_to_points,
+# Import dense_init directly to avoid scene/__init__.py pulling in the full torch stack
+_spec = importlib.util.spec_from_file_location(
+    "dense_init",
+    os.path.join(os.path.dirname(__file__), "..", "scene", "dense_init.py"),
 )
+_dense_init = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_dense_init)
+
+AlignmentFailed = _dense_init.AlignmentFailed
+AlignmentResult = _dense_init.AlignmentResult
+RansacConfig    = _dense_init.RansacConfig
+align_depth_to_sfm = _dense_init.align_depth_to_sfm
+depth_to_points    = _dense_init.depth_to_points
 
 
 # ---------------------------------------------------------------------------

@@ -927,12 +927,10 @@ class SphericalGaussianModel:
         self.max_radii2D = torch.cat(
             (self.max_radii2D, torch.zeros(n_new, device="cuda")), dim=0)
 
-    # Grace-period tracking for freshly inserted Gaussians (prevents pruning before training).
-    # Format: list of (start_idx, end_idx_exclusive, expires_at_iter)
-    _grace_records: list = []
-
     def mark_recently_added(self, idx_range: slice, iteration: int, grace_iters: int):
-        if not hasattr(self, '_grace_records'):
+        # Grace-period tracking: list of (start_idx, end_idx_exclusive, expires_at_iter)
+        # Lazy-initialized as instance attribute to avoid shared class-level state.
+        if not hasattr(self, '_grace_records') or not isinstance(self._grace_records, list):
             self._grace_records = []
         start = idx_range.start if idx_range.start is not None else 0
         stop = idx_range.stop if idx_range.stop is not None else self._xyz.shape[0]
@@ -941,7 +939,7 @@ class SphericalGaussianModel:
     def get_grace_protected_mask(self, current_iter: int) -> torch.Tensor:
         n = self._xyz.shape[0]
         mask = torch.zeros(n, dtype=torch.bool, device="cuda")
-        if not hasattr(self, '_grace_records'):
+        if not hasattr(self, '_grace_records') or not self._grace_records:
             return mask
         active = []
         for record in self._grace_records:
