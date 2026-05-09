@@ -16,15 +16,17 @@ Two bottleneck families dominate iters/sec and quality/iter in `progressive_trai
 
 A third axis — initialization quality — is the cheapest way to **reduce iters needed**: DAv2-small at 50k points/image is conservative for 4.5 GB free VRAM. Going to DAv2-base typically halves the depth error and reduces required `iter_initial` and `iter_per_merge`.
 
-Top three recommended changes (high impact, low risk, all Python-only):
+Top recommended changes (high impact, low risk, all Python-only):
 
 | # | Change | Iters/sec | Iters needed | Effort |
 |---|--------|-----------|--------------|--------|
 | **P1** | Stop rebuilding Adam after prune (preserve state) | +5-10% | -10-25% | S |
 | **P3** | DAv2-base + 100k dense points/image, dense-init from snapshot 0 | -5% | -25-40% | S |
+| **P12** | Convergence-driven scheduling: monitor + elastic budget + early stopping + fast final refinement | +10-30% | -20-50% | M |
+| **P13** | Content-driven densify/prune trigger predicates | +5-15% | -5-15% | M |
 | **P5** | Multi-view gradient accumulation (2-4 cams/step, pure PyTorch) | +10-25% | -10-30% | M |
 
-Cumulative: realistic 1.5-2× wall-clock speedup to a comparable-quality scene. CUDA kernel-level work (P10, P11) is **not recommended** for this hardware — the user's bottleneck is Python and optimiser bookkeeping, not raster throughput.
+Cumulative: realistic 2-3× wall-clock speedup to a comparable-quality scene. CUDA kernel-level work (P10, P11) is **not recommended** for this hardware — the user's bottleneck is Python, optimiser bookkeeping, and over-training, not raster throughput.
 
 ---
 
@@ -341,18 +343,369 @@ Currently `dense_init_for_new_images` opens `with DepthAnythingV2Wrapper(...)` (
 
 ---
 
+### P12 — Convergence-driven scheduling (replaces parts of P4)
+
+**Goal**: replace fixed iteration counts with content-driven decisions. Train each phase only as long as it's useful; let the Gaussian budget grow only as the scene demands; replace the 4000-iter "final refinement" with a fast compression pass.
+
+**Files**:
+- `progressive_train.py` (new module: `scene/convergence.py`)
+- `configs/progressive.yaml`
+
+**Background**:
+The current schedule hard-codes `iter_initial: 3000`, `iter_per_merge: 200 * len(new_cams)`, `iter_final: 4000`, and `num_max: 800000` as a flat ceiling. None of these adapt to scene complexity. A simple scene wastes thousands of iters at the cap; a complex scene that could use more capacity hits the wall early.
+
+The 4000-iter final phase is mostly compression (see §destructive-reset analysis): a 5 % importance prune, a destructive `reinitial_pts` reset, 2400 reconverge iters, a second 5 % prune, then SG axis culling. Net file-size reduction is ~10 %; net quality gain is small. This can collapse to seconds.
+
+**Tasks**:
+
+1. **Add `scene/convergence.py`** with a `ConvergenceMonitor` class:
+   ```python
+   from collections import deque
+
+   class ConvergenceMonitor:
+       def __init__(self, loss_window=200, densify_window=10):
+           self.loss_history = deque(maxlen=loss_window)
+           self.densify_history = deque(maxlen=densify_window)
+
+       def update_loss(self, ema_loss: float):
+           self.loss_history.append(ema_loss)
+
+       def update_densify(self, n_added: int, n_total: int):
+           self.densify_history.append(n_added / max(n_total, 1))
+
+       def relative_slope(self) -> float:
+           if len(self.loss_history) < self.loss_history.maxlen:
+               return float('-inf')  # not enough data → assume improving
+           recent = list(self.loss_history)
+           slope = (recent[-1] - recent[0]) / len(recent)
+           return slope / max(recent[-1], 1e-8)
+
+       def densify_saturation(self) -> float:
+           if not self.densify_history:
+               return 0.0
+           return max(self.densify_history)
+
+       def state(self,
+                 converged_slope=-1e-4,
+                 active_densify=0.05,
+                 active_slope=-1e-3) -> str:
+           s = self.relative_slope()
+           d = self.densify_saturation()
+           if s > converged_slope and d < 0.01:
+               return "converged"
+           if d > active_densify and s < active_slope:
+               return "wants_capacity"
+           if s < active_slope:
+               return "improving"
+           return "stalled"
+   ```
+   Thresholds are starting heuristics. Log `relative_slope` and `densify_saturation` to the diary every 100 iter for one full run; pick thresholds where the curves visibly knee.
+
+2. **Wire monitor updates into `train_window`** (`progressive_train.py:464-722`):
+   - Construct `monitor = ConvergenceMonitor()` at top of `train_window`.
+   - After `ema_loss = ...` (line 541): `monitor.update_loss(ema_loss)`.
+   - After every densify call (lines 569 and 597): `monitor.update_densify(n_after - n_before, n_after)` — track the count yourself by reading `gaussians._xyz.shape[0]` before and after.
+
+3. **Add early stopping per phase**:
+   ```python
+   min_iters = max(n_iters // 4, 200)  # never bail in first quarter
+   for phase_iter in range(1, n_iters + 1):
+       ...
+       if phase_iter > min_iters and monitor.state() == "converged":
+           logger.info(f"[{phase}] early stop at iter {phase_iter}/{n_iters}")
+           break
+   ```
+   `iter_initial` / `iter_per_merge` / `iter_final` become *caps*, not targets.
+
+4. **Add elastic Gaussian budget**. New config:
+   ```yaml
+   training:
+     num_max_floor: 200000
+     num_max_ceiling: 800000        # was: num_max
+     num_max_step: 50000
+     num_max_unlock_cooldown: 500
+   ```
+   In `train_window`:
+   ```python
+   n_current_cap = config.training.num_max_floor
+   last_unlock_iter = 0
+   ...
+   # Inside iter loop, after densification stats update:
+   if (monitor.state() == "wants_capacity"
+           and phase_iter - last_unlock_iter > config.training.num_max_unlock_cooldown
+           and n_current_cap < config.training.num_max_ceiling):
+       n_current_cap = min(n_current_cap + config.training.num_max_step,
+                           config.training.num_max_ceiling)
+       last_unlock_iter = phase_iter
+       logger.info(f"[budget] unlocked → {n_current_cap}")
+   ```
+   Replace every read of `training_cfg.num_max` (lines 552, 595) with `n_current_cap`. Remove `num_max` from config; treat `num_max_ceiling` as the hard VRAM-bounded ceiling.
+
+5. **Add fast final refinement mode**. New config:
+   ```yaml
+   training:
+     final_refinement_mode: fast     # "fast" | "full"
+     fast_final_prune_ratio: 0.10
+   ```
+   New function in `progressive_train.py`:
+   ```python
+   def fast_final_compression(gaussians, prog_scene, opt, pipe, config, global_iter):
+       """Single-shot importance prune + SG axis culling. Replaces 4000-iter final phase."""
+       background = torch.tensor([0,0,0], dtype=torch.float32, device="cuda")
+       imp_score = update_imp_score(
+           prog_scene.train_cameras, gaussians, pipe, background,
+           imp_metric=config.training.imp_metric,
+       )
+       grace_mask = gaussians.get_grace_protected_mask(global_iter)
+       ratio = config.training.fast_final_prune_ratio
+       threshold = int(ratio * imp_score.shape[0])
+       imp_sorted, _ = torch.sort(imp_score, 0)
+       cutoff = imp_sorted[max(threshold - 1, 0)]
+       prune_mask = (imp_score <= cutoff).squeeze() & ~grace_mask
+       n_before = gaussians._xyz.shape[0]
+       gaussians.prune_points(prune_mask)
+       gaussians.cull_low_sharpness_axes(
+           sharpness_threshold=config.training.sharpness_threshold)
+       torch.cuda.empty_cache()
+       logger.info(f"[fast-final] pruned {n_before} → {gaussians._xyz.shape[0]}, axes culled")
+   ```
+   In `progressive_training` (line 879), branch:
+   ```python
+   if config.training.final_refinement_mode == "fast":
+       fast_final_compression(gaussians, prog_scene, opt, pipe, config, global_iter)
+   else:
+       gaussians.update_learning_rate(0)
+       global_iter += train_window(..., phase="final", ...)
+   ```
+
+**Test plan**:
+- **Step 1 (observability only)**: monitor enabled, no behaviour changes (still use fixed iter counts and flat cap). Log monitor state every 100 iter. Eyeball the curve to confirm convergence detection makes sense on your data.
+- **Step 2**: enable early stopping with `min_iters = n_iters // 2`. Confirm wall-clock drops, PSNR holds.
+- **Step 3**: enable elastic budget. Track peak `n_current_cap` reached on a complex vs simple scene; should differ. Confirm iters/sec stays high through early ramp.
+- **Step 4**: enable `final_refinement_mode: fast`. Compare PSNR / SSIM / file size against `full` baseline on at least two scenes. If `fast` is within 0.3 dB PSNR and file size is comparable, ship it as default.
+
+**Risk**:
+- Monitor thresholds need real-data tuning (medium); ship with sane defaults plus logging so users can see when state transitions happen.
+- Early stopping that fires too aggressively will hurt quality (medium); the `n_iters // 4` floor is the safety belt.
+- Elastic budget interacts with P4's prune cadence (low if both use the monitor; medium otherwise). When P12 lands, **simplify P4**: drop the soft-cap-fraction logic; let `num_max_ceiling` be the hard bound and the monitor drive everything else.
+- Fast final refinement loses the `reinitial_pts` reset effect (low-to-medium). Ablate per-scene.
+
+**Effect on other briefs**:
+- **Replaces** the soft-cap parts of P4. P4 becomes "tune `min_opacity` and `densify_grad_threshold`" only.
+- **Composes** with P13 (smart triggers): the monitor state feeds the trigger predicates.
+
+---
+
+### P13 — Content-driven trigger predicates (replaces fixed cadences)
+
+**Goal**: replace `phase_iter % densification_interval == 0` and `prune_every_n_snapshots` with predicates evaluated against per-Gaussian evidence and the convergence monitor. No hard-coded behaviour intervals; only cost-bounded check intervals.
+
+**Files**:
+- `scene/triggers.py` (new)
+- `progressive_train.py` (replace cadence checks in `train_window` and `progressive_training`)
+
+**Background — what fires what today**:
+
+| Event | Selection (per-Gaussian) | Firing trigger (today) |
+|-------|--------------------------|------------------------|
+| `densify_and_clone` | grad ≥ threshold AND scaling ≤ percent_dense × extent | flat 100-iter cadence |
+| `densify_and_split_mask` | (grad ≥ threshold AND scaling > percent_dense × extent) **OR** `mask_blur` (Gaussian covered > image_area/5000 in any view since last densify) | flat 100-iter cadence (paired with clone) |
+| Opacity/size prune (inside `densify_and_prune_split`) | opacity < 0.005 OR oversize | paired with densify (no independent cadence) |
+| `lightweight_prune` | bottom prune_ratio1 by importance | every N snapshots |
+
+The selection logic is already evidence-based per Gaussian. Only the firing cadence is dumb.
+
+**Shared substrate**:
+
+```python
+# scene/triggers.py
+
+def evidence_settled(gaussians, min_obs=10, min_seen_fraction=0.5):
+    """True iff per-Gaussian gradients have enough observations to act on."""
+    denom = gaussians.denom.squeeze()
+    seen = denom > 0
+    if seen.sum().item() < min_seen_fraction * len(denom):
+        return False
+    return denom[seen].min().item() >= min_obs
+
+
+def should_densify(gaussians, opt, mask_blur,
+                   last_densify_iter, current_iter,
+                   min_settling=50,
+                   candidate_fraction=0.005,
+                   max_interval=500):
+    """Fire densify when per-Gaussian gradient evidence shows enough candidates,
+    or as a stale-flush after max_interval iters."""
+    if current_iter - last_densify_iter < min_settling:
+        return False
+    if current_iter - last_densify_iter > max_interval:
+        return True  # force-flush stale grad accum
+
+    if not evidence_settled(gaussians):
+        return False
+    grads = gaussians.xyz_gradient_accum / gaussians.denom.clamp(min=1)
+    n_clone = (grads.squeeze() >= opt.densify_grad_threshold).sum().item()
+    n_split = mask_blur.sum().item()
+    n_total = gaussians._xyz.shape[0]
+    return (n_clone + n_split) / max(n_total, 1) > candidate_fraction
+
+
+def should_fast_prune(gaussians, opt, dead_fraction=0.02):
+    """Fire opacity/size prune when enough dead splats have accumulated.
+    Cheap; can be checked every iter."""
+    min_op = getattr(opt, 'min_opacity_threshold', 0.005)
+    dead = (gaussians.get_opacity < min_op).sum().item()
+    return dead / gaussians._xyz.shape[0] > dead_fraction
+
+
+def should_lightweight_prune(gaussians, monitor, n_at_last_prune,
+                              soft_cap, growth_threshold=0.10):
+    """Fire importance-prune on cap breach OR stagnation-with-growth.
+    Expensive predicate (caller gates frequency)."""
+    n = gaussians._xyz.shape[0]
+    if n > soft_cap:
+        return True
+    grew = (n - n_at_last_prune) / max(n_at_last_prune, 1) > growth_threshold
+    if grew and monitor.state() == "stalled":
+        return True
+    return False
+
+
+def should_cull_sg_axes(gaussians, sharpness_threshold,
+                        fraction_low=0.20):
+    """Fire SG axis culling once enough axes are below sharpness threshold."""
+    if gaussians.max_sg_degree == 0:
+        return False
+    sharpness = gaussians.get_sg_sharpness  # (N, K, 1)
+    low_fraction = (sharpness < sharpness_threshold).float().mean().item()
+    return low_fraction > fraction_low
+```
+
+**Tasks**:
+
+1. **Decouple opacity/size prune from densify**. Add `gaussians.opacity_size_prune(min_opacity, max_screen_size, extent)` that runs only the prune block from `densify_and_prune_split` (`spherical_gaussian_model.py:804-809`), no clone/split. Keep `densify_and_prune_split` working for backward compat; add the new method.
+
+2. **Replace cadence checks in `train_window`** (`progressive_train.py:566-604`):
+   ```python
+   # State carried across iters
+   last_densify_iter = 0
+   last_fast_prune_check = 0
+   last_lightweight_prune_iter = 0
+   n_at_last_prune = gaussians._xyz.shape[0]
+
+   # Inside iter loop:
+
+   # Cheap: every iter, but only acts on real evidence
+   if should_fast_prune(gaussians, opt):
+       gaussians.opacity_size_prune(
+           min_opacity=getattr(opt, 'min_opacity_threshold', 0.005),
+           max_screen_size=20 if phase == "initial" else None,
+           extent=prog_scene.cameras_extent,
+       )
+
+   # Medium-cost predicate: check every 50 iter
+   if (phase_iter % 50 == 0
+           and gaussians._xyz.shape[0] < n_current_cap):
+       if should_densify(gaussians, opt, mask_blur,
+                         last_densify_iter, phase_iter):
+           n_before = gaussians._xyz.shape[0]
+           gaussians.densify_and_prune_split(
+               opt.densify_grad_threshold, 0.005,
+               prog_scene.cameras_extent,
+               20 if phase == "initial" else None,
+               mask_blur[:gaussians.xyz_gradient_accum.shape[0]],
+           )
+           n_after = gaussians._xyz.shape[0]
+           monitor.update_densify(n_after - n_before, n_after)
+           mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
+           last_densify_iter = phase_iter
+
+   # Expensive predicate: check every 200 iter
+   if phase_iter % 200 == 0 and phase != "initial":
+       soft_cap = int(config.training.num_max_ceiling * 0.85)
+       if should_lightweight_prune(gaussians, monitor,
+                                    n_at_last_prune, soft_cap):
+           lightweight_prune(gaussians, prog_scene, opt, config, global_iter)
+           n_at_last_prune = gaussians._xyz.shape[0]
+           last_lightweight_prune_iter = phase_iter
+
+   # Late-phase compression: once when triggered
+   if (phase == "final" and phase_iter > n_iters * 0.85
+           and not has_culled
+           and should_cull_sg_axes(gaussians, config.training.sharpness_threshold)):
+       gaussians.cull_low_sharpness_axes(
+           sharpness_threshold=config.training.sharpness_threshold)
+       has_culled = True
+   ```
+
+3. **Replace `prune_every_n_snapshots` in `progressive_training`** (`progressive_train.py:872-873`):
+   ```python
+   # Before:
+   # if snapshot_count % config.training.prune_every_n_snapshots == 0:
+   #     lightweight_prune(...)
+
+   # After: rely on the in-loop predicate to fire as needed.
+   # Keep an explicit post-snapshot soft-cap check as a safety valve:
+   soft_cap = int(config.training.num_max_ceiling * 0.85)
+   if gaussians._xyz.shape[0] > soft_cap:
+       lightweight_prune(gaussians, prog_scene, opt, config, global_iter)
+   ```
+
+4. **Add config knobs**:
+   ```yaml
+   training:
+     densify_min_obs: 10
+     densify_min_settling: 50
+     densify_max_interval: 500
+     densify_candidate_fraction: 0.005
+     fast_prune_dead_fraction: 0.02
+     lightweight_prune_growth_threshold: 0.10
+     sg_axis_cull_low_fraction: 0.20
+   ```
+   Wire each as the corresponding predicate's optional arg.
+
+5. **Logging**. Each predicate fire should emit a debug log line with the reason: which condition tripped (`evidence_settled`, candidate fraction, max_interval flush, soft cap, etc.). Crucial for tuning.
+
+**Test plan**:
+
+- **Phase 1 — predicate observability only**. Add the predicates and log their decisions at the existing fixed cadence checkpoints. Run a normal training session. For each old fixed-cadence fire, log whether the predicate would have fired. Build histograms of "predicate would fire" times vs "old fire" times. Confirm the predicate is at least as frequent as the old cadence at the start (or deliberately less, if the scene is converging fast).
+
+- **Phase 2 — predicate-driven, with safety nets**. Replace the old cadence checks with predicates BUT keep `densify_max_interval` as a hard upper bound on dormancy. Run end-to-end. Compare:
+  - Wall-clock per snapshot (should be similar or slightly faster).
+  - Final PSNR / SSIM (should match within noise).
+  - Total number of densify calls (should be lower for simple scenes, similar for complex scenes).
+  - Total number of prune calls (should track densify calls + cap pressure).
+
+- **Phase 3 — relax safety nets**. Once Phase 2 passes, bump `densify_max_interval` to 2000 (effectively disabled). Confirm no quality regression.
+
+**Risk**:
+- Predicate thresholds need tuning per scene type. Ship with conservative defaults; expose all as config.
+- The "settling period" before evaluating evidence (`min_settling`) interacts with new Gaussian addition: after `expand_from_pcd`, freshly-added Gaussians have `denom = 0`, which trips `evidence_settled`'s "too many fresh" guard. This is correct behaviour — wait until they've been observed — but means the first densify after a snapshot expansion may be delayed. Acceptable.
+- Decoupling opacity/size prune from densify changes the loop semantics slightly: previously a Gaussian could be cloned and then immediately pruned in the same call (if the clone landed below opacity threshold). Now those run separately. Validate no quality regression; if there is one, run opacity_size_prune immediately after densify call as a hot-fix.
+
+**Composition with other briefs**:
+- **Requires P12** (`monitor` is a P13 input). Land P12 first.
+- **Subsumes P4**'s soft-cap logic. With P13, P4 reduces to "tune `min_opacity` to 0.01 in config" — a one-line change.
+- **Independent of** P1, P2, P3, P5, P6, P7, P8 (all orthogonal).
+
+---
+
 ## 5. Suggested Execution Order
 
 For a Sonnet instance picking this up:
 
 1. **Day 1**: P1 (Adam preservation) and P2 (view-dir dedup) — both small, validate independently.
 2. **Day 1**: P3 (config-only DAv2 upgrade) — baseline measurement.
-3. **Day 2**: P5 (multi-view accumulation) — largest single win, most validation needed. Compare K=1 (regression check), K=2, K=4.
-4. **Day 2**: P6, P7, P8 — small wall-clock savings, easy.
-5. **Day 3**: P4 (smarter prune cadence) — needs more soak-test runs.
-6. **Day 3**: P9 (screenspace pool) — only if profile shows allocator pressure.
+3. **Day 2**: P12 (convergence monitor + elastic budget + early stopping + fast final refinement) — largest qualitative shift in how training is scheduled. Land in four sub-steps with monitor-only observability first, then incremental enables.
+4. **Day 2-3**: P13 (content-driven trigger predicates) — depends on P12's monitor. Validate per Phase 1/2/3 plan in the brief.
+5. **Day 3**: P5 (multi-view accumulation) — largest single iters/sec win; needs careful K=1 regression check.
+6. **Day 3**: P6, P7, P8 — small wall-clock savings, easy.
+7. **Day 4**: P4 (now reduced to: tune `min_opacity` to 0.01 once P12 + P13 land).
+8. **Day 4**: P9 (screenspace pool) — only if profile shows allocator pressure.
 
-After all P1-P9 land, expected cumulative improvement: 1.5-2× wall-clock to comparable-quality scenes; another 20-40% PSNR-at-fixed-budget improvement from P3 alone.
+**Note on P4**: once P12 and P13 land, P4's soft-cap logic is subsumed by the elastic budget and the cap-driven `should_lightweight_prune` predicate. P4 becomes a one-line config tweak.
+
+After all of P1, P2, P3, P5, P6, P7, P8, P12, P13 land, expected cumulative improvement: 2-3× wall-clock to comparable-quality scenes, with quality-per-iter also improving from P3 (better init), P5 (better gradient signal), and P12 (no over-training).
 
 ## 6. Validation Harness
 
