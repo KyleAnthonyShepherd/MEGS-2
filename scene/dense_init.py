@@ -120,7 +120,6 @@ class DepthAnythingV2Wrapper:
         Returns:
             (H, W) float32 tensor on CPU — DAv2 raw output (relative disparity).
         """
-        import logging as _logging
         import torch as _torch
         from PIL import Image as PILImage
         img_np = (image_chw.cpu().float().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
@@ -134,27 +133,10 @@ class DepthAnythingV2Wrapper:
 
         with _torch.no_grad():
             outputs = self.model(**inputs)
-        depth = outputs.predicted_depth  # (1, H', W'), fp16 if fp16 mode
+        depth = outputs.predicted_depth  # (1, H', W')
 
-        # If the entire output is non-finite (fp16 overflow across the full forward
-        # pass), retry once in float32.  DAv2-Large is ~670 MB in fp16; the retry
-        # costs ~670 MB extra VRAM, which is safe between snapshots.
-        if self.cfg.fp16 and not _torch.isfinite(depth).any():
-            _logging.getLogger("dense-init").warning(
-                "DAv2 fp16 forward pass produced all-invalid output; retrying in float32"
-            )
-            self.model.float()
-            try:
-                inputs_f32 = {k: v.float() if v.is_floating_point() else v
-                              for k, v in inputs.items()}
-                with _torch.no_grad():
-                    outputs = self.model(**inputs_f32)
-                depth = outputs.predicted_depth
-            finally:
-                self.model.half()  # restore fp16 for subsequent images
-
-        # Sanitize before interpolation: any remaining inf/nan (partial overflow or
-        # boundary artefacts) would spread via bilinear interp to neighbouring pixels.
+        # Sanitize before interpolation: inf/nan at any pixel spreads to neighbours
+        # via bilinear interp.
         depth = _torch.nan_to_num(depth.float(), nan=0.0, posinf=0.0, neginf=0.0)
         H_orig, W_orig = image_chw.shape[1], image_chw.shape[2]
         depth = _torch.nn.functional.interpolate(

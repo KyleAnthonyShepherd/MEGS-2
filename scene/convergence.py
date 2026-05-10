@@ -12,9 +12,23 @@ class ConvergenceMonitor:
     def update_densify(self, n_added: int, n_total: int):
         self.densify_history.append(n_added / max(n_total, 1))
 
+    def reset(self, fraction_changed: float = 1.0):
+        """Clear loss history after a structural scene change.
+
+        fraction_changed: fraction of Gaussians added or removed (0–1).
+        The minimum entries required before convergence can fire again is
+        scaled by this fraction — a 70% prune needs ~140 fresh entries; a
+        5% trim only needs ~10, so the system can re-detect quickly.
+        """
+        self.loss_history.clear()
+        self._min_entries = max(10, int(self.loss_history.maxlen * fraction_changed))
+
     def relative_slope(self) -> float:
-        if len(self.loss_history) < self.loss_history.maxlen:
+        min_entries = getattr(self, '_min_entries', self.loss_history.maxlen)
+        if len(self.loss_history) < min_entries:
             return float('-inf')  # not enough data → assume improving
+        # Reset the threshold once we have enough data
+        self._min_entries = self.loss_history.maxlen
         recent = list(self.loss_history)
         slope = (recent[-1] - recent[0]) / len(recent)
         return slope / max(recent[-1], 1e-8)
