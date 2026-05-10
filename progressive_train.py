@@ -698,6 +698,9 @@ def train_window(
                                             growth_threshold=training_cfg.lightweight_prune_growth_threshold):
                     lightweight_prune(gaussians, prog_scene, opt, config, global_iter)
                     n_at_last_prune = gaussians._xyz.shape[0]
+                    # Scene changed significantly — old slope estimate is stale.
+                    # Clear history so convergence can't fire in the same iteration.
+                    monitor.loss_history.clear()
 
             # T7: late-phase SG axis cull (final phase only, triggered once at 85%+)
             if (phase == "final"
@@ -726,8 +729,9 @@ def train_window(
     # T8: per-phase SkipGS summary
     if skipgs is not None and skipgs._step > 0:
         rho_cum = skipgs._backward_count / max(skipgs._step, 1)
+        rho_min_str = f"{skipgs._rho_min:.3f}" if skipgs._rho_min is not None else "n/a (warmup incomplete)"
         logger.info(
-            f"[skipgs] rho_min={skipgs._rho_min:.3f} "
+            f"[skipgs] rho_min={rho_min_str} "
             f"steps={skipgs._step} backward={skipgs._backward_count} "
             f"rho_cum={rho_cum:.3f}"
         )
@@ -840,6 +844,13 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
             config.dense_init, opt, current_iter=0,
             dav2_model=_persistent_dav2,
         )
+        soft_cap = int(config.training.num_max_ceiling * 0.85)
+        if gaussians._xyz.shape[0] > soft_cap:
+            logger.info(
+                f"[dense-init] {gaussians._xyz.shape[0]} Gaussians exceed soft_cap "
+                f"({soft_cap}); pruning before initial phase ..."
+            )
+            lightweight_prune(gaussians, prog_scene, opt, config, global_iter=0)
 
     bg_white = getattr(dataset, 'white_background', False)
     global_iter = 0
