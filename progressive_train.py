@@ -498,9 +498,10 @@ def train_window(
 
     # T7: convergence monitor + trigger state
     monitor = ConvergenceMonitor()
-    # Settling guard: don't re-evaluate densify until new Gaussians have been observed.
-    # Tracks denom.sum() target rather than iteration count.
-    densify_denom_settled = 0.0
+    # Settling guard: CPU-only countdown in contributing-view steps.
+    # Decremented by sum(gate) each iter — zero GPU work while settling.
+    # evidence_settled() inside should_densify does the precise per-Gaussian check.
+    densify_settle_views = 0
     n_at_last_prune = gaussians._xyz.shape[0]
     has_culled = False
     soft_cap = int(training_cfg.num_max_ceiling * 0.85)
@@ -628,6 +629,11 @@ def train_window(
 
         # ---- no_grad: stats, T7 triggers, convergence check ----
         with torch.no_grad():
+            # Advance settling countdown (pure Python, no GPU sync).
+            n_contributing = sum(gate)
+            if densify_settle_views > 0:
+                densify_settle_views = max(0, densify_settle_views - n_contributing)
+
             ema_loss = 0.4 * loss.item() + 0.6 * ema_loss
             if phase_iter % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss:.7f}",
@@ -662,9 +668,9 @@ def train_window(
                 )
 
             # T7: evidence-based densify.
-            # Settling guard: skip until new Gaussians have accumulated enough observations.
-            if (gaussians._xyz.shape[0] < training_cfg.num_max_ceiling
-                    and gaussians.denom.sum().item() >= densify_denom_settled):
+            # Outer guard is pure Python (densify_settle_views countdown) — no GPU sync
+            # unless the predicate is actually worth evaluating.
+            if densify_settle_views == 0 and gaussians._xyz.shape[0] < training_cfg.num_max_ceiling:
                 if should_densify(gaussians, opt, mask_blur,
                                   candidate_fraction=training_cfg.densify_candidate_fraction,
                                   min_obs=training_cfg.densify_min_obs):
@@ -681,8 +687,9 @@ def train_window(
                     n_added = max(n_after - n_before, 0)
                     monitor.update_densify(n_added, n_after)
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
-                    # New Gaussians must accumulate min_obs observations before re-evaluating
-                    densify_denom_settled = gaussians.denom.sum().item() + training_cfg.densify_min_obs * n_added
+                    # Start settling countdown: wait min_obs contributing views before re-evaluating.
+                    # evidence_settled() inside should_densify verifies actual per-Gaussian counts.
+                    densify_settle_views = training_cfg.densify_min_obs
 
             # T7: lightweight importance prune — fire when monitor says stalled/converged
             if phase != "initial" and monitor.state() in ("stalled", "converged"):
