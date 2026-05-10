@@ -232,10 +232,10 @@ class SphericalGaussianModel:
             campos = viewpoint_camera.camera_center.to(self._xyz.device)
             active_bases = self.get_active_sg_degree()
 
-            if is_training or not self.variable_sg_bands:
-                view_dirs = campos.unsqueeze(0) - self._xyz  
-                view_dirs = view_dirs / (torch.norm(view_dirs, dim=1, keepdim=True) + 1e-8)
+            view_dirs = campos.unsqueeze(0) - self._xyz
+            view_dirs = view_dirs / (torch.norm(view_dirs, dim=1, keepdim=True) + 1e-8)
 
+            if is_training or not self.variable_sg_bands:
                 device = self._xyz.device
                 arange_d = torch.arange(self.max_sg_degree, device=device)
                 valid_axis_mask = (arange_d[None, :] < self._sg_axis_count[:, None]) & (arange_d[None, :] < active_bases) 
@@ -257,9 +257,6 @@ class SphericalGaussianModel:
                 colors.scatter_add_(0, gaussian_indices_for_valid_axes.unsqueeze(1).expand(-1, 3), weighted_rgb)
 
             else:
-                view_dirs = campos.unsqueeze(0) - self._xyz  
-                view_dirs = view_dirs / (torch.norm(view_dirs, dim=1, keepdim=True) + 1e-8)
-
                 degree_indices_dict = {}
                 current = 0
                 for sg_degree in range(self.max_sg_degree + 1):
@@ -363,6 +360,17 @@ class SphericalGaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+
+    def reset_densification_buffers(self):
+        """Reset per-Gaussian accumulation buffers used by densification.
+
+        Call this instead of training_setup after prune_points (which preserves
+        Adam state via _prune_optimizer). Do NOT call after reinitial_pts —
+        that creates new nn.Parameter instances, so training_setup is required.
+        """
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def update_learning_rate(self, iteration):
         for param_group in self.optimizer.param_groups:
@@ -557,6 +565,21 @@ class SphericalGaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def opacity_size_prune(self, min_opacity, max_screen_size, extent):
+        """Prune dead (low opacity) and oversize Gaussians without clone/split.
+
+        Decoupled from densify_and_prune_split so it can be called cheaply
+        every iteration under T7's evidence-based scheduling.
+        """
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size is not None:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(
+                torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        self.prune_points(prune_mask)
+        torch.cuda.empty_cache()
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
