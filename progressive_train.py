@@ -40,13 +40,16 @@ from scene.dense_init import (
     transform_to_camera_frame, AlignmentFailed,
     DAv2Config, RansacConfig,
 )
-from spherical_gaussian_renderer import render_depth, render_imp
+from scene.convergence import ConvergenceMonitor
+from scene.triggers import (
+    should_densify, should_fast_prune,
+    should_lightweight_prune, should_cull_sg_axes,
+)
+from scene.skipgs import SkipGSGate
+from spherical_gaussian_renderer import render_imp
 from utils.loss_utils import l1_loss, ssim
 from utils.graphics_utils import BasicPointCloud
 from utils.image_utils import psnr
-from utils.sh_utils import SH2RGB
-from optimizing_spa import OptimizingSpa
-from optimizing_spa_sg import OptimizingSpaSG
 
 try:
     from fused_ssim import fused_ssim
@@ -67,22 +70,49 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class SkipGSConfig:
+    enabled: bool = True
+    phase: str = "final"
+    warmup: int = 500
+    beta: float = 0.95
+    eps: float = 1e-8
+    rho_lo: float = 0.5
+
+
+@dataclass
 class TrainingConfig:
+    # Iteration caps (convergence drives early exit; these are safety belts)
     iter_initial: int = 3000
     iter_per_merge: int = 200
     iter_final: int = 4000
-    num_max: int = 800_000
-    prune_every_n_snapshots: int = 5
-    simp_iteration1_frac: float = 0.40
-    optimizing_spa_start_iter_frac: float = 0.50
-    optimizing_spa_stop_iter_frac: float = 0.80
-    optimizing_spa_sg_stop_iter_frac: float = 0.95
+
+    # Single VRAM-bounded Gaussian ceiling
+    num_max_ceiling: int = 800_000
+
+    # Pruning ratios
     prune_ratio1: float = 0.05
     prune_ratio2: float = 0.05
     sharpness_threshold: float = 1.0
-    optimizing_spa_interval: int = 100
-    merge_densification_interval: int = 100
     imp_metric: str = "outdoor"
+
+    # T5: camera subsample in update_imp_score (0 = all cameras)
+    imp_score_camera_subsample: int = 0
+
+    # T6: multi-view gradient accumulation (1 = original single-view)
+    accumulation_views: int = 1
+
+    # T7: trigger predicate knobs
+    densify_min_obs: int = 10
+    densify_candidate_fraction: float = 0.005
+    fast_prune_dead_fraction: float = 0.02
+    lightweight_prune_growth_threshold: float = 0.10
+    sg_axis_cull_low_fraction: float = 0.20
+
+    # T7: fast final compression ratio
+    fast_final_prune_ratio: float = 0.10
+
+    # T8: SkipGS gate config
+    skipgs: SkipGSConfig = field(default_factory=SkipGSConfig)
 
 
 @dataclass
@@ -96,6 +126,7 @@ class DenseInitConfig:
     depth_disagreement_threshold: float = 0.10
     max_rejected_fraction: float = 0.5
     grace_iters: int = 200
+    persist_model: bool = False         # T4: hold DAv2 across snapshots
     dav2: DAv2Config = field(default_factory=DAv2Config)
     ransac: RansacConfig = field(default_factory=RansacConfig)
 
@@ -122,7 +153,11 @@ def load_config(yaml_path: str) -> ProgressiveConfig:
 
     if "training" in raw:
         for k, v in raw["training"].items():
-            if hasattr(cfg.training, k):
+            if k == "skipgs" and isinstance(v, dict):
+                for sk, sv in v.items():
+                    if hasattr(cfg.training.skipgs, sk):
+                        setattr(cfg.training.skipgs, sk, sv)
+            elif hasattr(cfg.training, k):
                 setattr(cfg.training, k, v)
 
     if "dense_init" in raw:
@@ -151,10 +186,21 @@ def load_config(yaml_path: str) -> ProgressiveConfig:
 # Importance scoring (lifted from train.py)
 # ---------------------------------------------------------------------------
 
-def update_imp_score(cameras, gaussians, pipe, background, imp_metric="outdoor"):
+def update_imp_score(cameras, gaussians, pipe, background, imp_metric="outdoor",
+                     subsample_n: int = 0, weights=None):
+    # T5: optional camera subsampling by weight
+    active_cameras = list(cameras)
+    if subsample_n > 0 and len(active_cameras) > subsample_n:
+        if weights is not None and len(weights) == len(active_cameras):
+            sorted_idx = np.argsort(weights)[::-1]
+            active_cameras = [active_cameras[i] for i in sorted_idx[:subsample_n]]
+        else:
+            active_cameras = list(np.random.choice(active_cameras, size=subsample_n, replace=False))
+    scale = len(cameras) / max(len(active_cameras), 1)
+
     imp_score = torch.zeros(gaussians._xyz.shape[0]).cuda()
     accum_area_max = torch.zeros(gaussians._xyz.shape[0]).cuda()
-    for view in cameras:
+    for view in active_cameras:
         render_pkg = render_imp(view, gaussians, pipe, background, is_training=True)
         accum_weights = render_pkg["accum_weights"]
         area_proj = render_pkg["area_proj"]
@@ -167,6 +213,8 @@ def update_imp_score(cameras, gaussians, pipe, background, imp_metric="outdoor")
         else:
             imp_score = imp_score + accum_weights
     imp_score[accum_area_max == 0] = 0
+    if subsample_n > 0 and scale != 1.0:
+        imp_score = imp_score * scale
     return imp_score
 
 
@@ -267,8 +315,16 @@ def dense_init_for_new_images(
     dense_cfg: DenseInitConfig,
     opt,
     current_iter: int,
+    dav2_model=None,
 ):
-    """Run DAv2 on each new image, align to SfM, filter, append as Gaussians."""
+    """Run DAv2 on each new image, align to SfM, filter, append as Gaussians.
+
+    dav2_model: optional pre-loaded DepthAnythingV2Wrapper (T4 persistence).
+                When provided, the caller owns the model lifecycle; this function
+                will NOT open or close a context manager.
+    """
+    import time
+    t_start = time.monotonic()
     accumulated_xyz = []
     accumulated_rgb = []
     scene_scale = prog_scene.cameras_extent
@@ -276,7 +332,7 @@ def dense_init_for_new_images(
     pre_vram = torch.cuda.memory_allocated() / 1024 ** 2
     logger.info(f"[dense-init] VRAM before DAv2 context: {pre_vram:.0f} MB")
 
-    with DepthAnythingV2Wrapper(dense_cfg.dav2) as depth_model:
+    def _run_cameras(depth_model):
         for cam in new_cams:
             sfm_xyz_all, visible_mask = prog_scene.get_sfm_points_visible_to(cam)
             sfm_xyz_visible = sfm_xyz_all[visible_mask]
@@ -288,7 +344,6 @@ def dense_init_for_new_images(
                 )
                 continue
 
-            # Depth-range check (avoid planar-scene rank deficiency)
             depths_in_cam = transform_to_camera_frame(sfm_xyz_visible, cam)[:, 2]
             depth_range = float(depths_in_cam.max() - depths_in_cam.min())
             if depth_range < dense_cfg.min_sfm_depth_range_fraction * scene_scale:
@@ -335,6 +390,12 @@ def dense_init_for_new_images(
                 f"[dense-init] {cam.image_name}: kept {len(xyz)} dense points "
                 f"(a={result.a:.3f}, b={result.b:.3f}, inliers={result.n_inliers})"
             )
+
+    if dav2_model is not None:
+        _run_cameras(dav2_model)
+    else:
+        with DepthAnythingV2Wrapper(dense_cfg.dav2) as depth_model:
+            _run_cameras(depth_model)
 
     post_vram = torch.cuda.memory_allocated() / 1024 ** 2
     logger.info(
@@ -385,9 +446,12 @@ def dense_init_for_new_images(
         iteration=current_iter,
         grace_iters=dense_cfg.grace_iters,
     )
+    elapsed = time.monotonic() - t_start
+    peak_vram = torch.cuda.max_memory_allocated() / 1024 ** 2
     logger.info(
         f"[dense-init] added {n_novel} dense Gaussians "
-        f"(rejected {len(all_xyz) - n_novel} as redundant)"
+        f"(rejected {len(all_xyz) - n_novel} as redundant); "
+        f"wall={elapsed:.1f}s peak_vram={peak_vram:.0f}MB"
     )
 
 
@@ -421,25 +485,40 @@ def train_window(
     diary_file=None,
     bg_white: bool = False,
 ):
-    """Run `n_iters` training iterations for the given phase.
+    """Run up to `n_iters` training iterations for the given phase.
 
-    Returns the number of global iterations consumed.
+    Returns the number of iterations actually consumed (may be < n_iters when
+    the convergence monitor reports early completion).
     """
     training_cfg = config.training
+    K = max(1, training_cfg.accumulation_views)  # T6: views per optimizer step
 
     bg_color = [1, 1, 1] if bg_white else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    # Phase-specific derived thresholds (for final phase only)
-    simp_iteration1 = int(n_iters * training_cfg.simp_iteration1_frac)
-    optimizing_spa_start_iter = int(n_iters * training_cfg.optimizing_spa_start_iter_frac)
-    optimizing_spa_stop_iter = int(n_iters * training_cfg.optimizing_spa_stop_iter_frac)
-    optimizing_spa_sg_stop_iter = int(n_iters * training_cfg.optimizing_spa_sg_stop_iter_frac)
-    optimizing_spa_sg_start_iter = optimizing_spa_start_iter  # same as SPA start
+    # T7: convergence monitor + trigger state
+    monitor = ConvergenceMonitor()
+    # Settling guard: CPU-only countdown in contributing-view steps.
+    # Decremented by sum(gate) each iter — zero GPU work while settling.
+    # evidence_settled() inside should_densify does the precise per-Gaussian check.
+    densify_settle_views = 0
+    n_at_last_prune = gaussians._xyz.shape[0]
+    has_culled = False
+    soft_cap = int(training_cfg.num_max_ceiling * 0.85)
 
-    # Position LR: in merge phase freeze at mid-warmup value to stabilise old Gaussians
+    # T8: SkipGS view-adaptive backward gate (configured phase only)
+    skipgs = None
+    if training_cfg.skipgs.enabled and phase == training_cfg.skipgs.phase:
+        skipgs = SkipGSGate(
+            warmup=training_cfg.skipgs.warmup,
+            beta=training_cfg.skipgs.beta,
+            eps=training_cfg.skipgs.eps,
+            rho_lo=training_cfg.skipgs.rho_lo,
+        )
+
+    # Position LR: in merge phase freeze at mid-schedule value to stabilise old Gaussians
     if phase == "merge":
-        mid_lr = gaussians.xyz_scheduler_args(simp_iteration1 // 2)
+        mid_lr = gaussians.xyz_scheduler_args(n_iters // 2)
         for pg in gaussians.optimizer.param_groups:
             if pg["name"] == "xyz":
                 pg["lr"] = mid_lr
@@ -448,123 +527,154 @@ def train_window(
     if phase == "final":
         gaussians.update_learning_rate(0)
 
-    optimizingSpa = None
-    optimizingSpaSg = None
-    imp_score = torch.zeros(gaussians._xyz.shape[0], device="cuda")
     mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
     viewpoint_stack = None
-
-    # Build per-camera weight lookup for merge phase
     image_weights = prog_scene.image_weights if phase == "merge" else None
 
-    desc = f"[{phase}]"
-    progress_bar = tqdm(range(n_iters), desc=desc)
+    progress_bar = tqdm(range(n_iters), desc=f"[{phase}]")
     ema_loss = 0.0
+    phase_iter = 0  # track in case loop body never executes
 
     for phase_iter in range(1, n_iters + 1):
         global_iter = global_iter_start + phase_iter
 
         # ---- LR update ----
-        if phase in ("initial", "merge"):
-            if phase == "initial":
-                gaussians.update_learning_rate(phase_iter)
-        else:  # final
-            if phase_iter < simp_iteration1:
-                gaussians.update_learning_rate(phase_iter)
-            else:
-                gaussians.update_learning_rate(phase_iter - simp_iteration1 + 5000)
-            if phase_iter % 1000 == 0 and phase_iter > simp_iteration1:
+        if phase == "initial":
+            gaussians.update_learning_rate(phase_iter)
+        elif phase == "final":
+            gaussians.update_learning_rate(phase_iter)
+            if phase_iter % 1000 == 0 and phase_iter > n_iters // 4:
                 gaussians.oneupSGdegree()
+        # merge: xyz LR frozen at mid-schedule (set once above)
 
-        # ---- Camera selection ----
-        if phase == "merge":
-            candidates = select_cameras_weighted(
-                prog_scene.train_cameras, image_weights,
-                n_top=10, n_random=10,
-            )
-            if not candidates:
-                candidates = prog_scene.train_cameras
-            viewpoint_cam = candidates[randint(0, len(candidates) - 1)]
-            cam_idx = prog_scene._cam_name_to_idx.get(viewpoint_cam.image_name, 0)
+        # ---- T6: K-view inner sub-loop ----
+        # per_view_packs: list of (loss_tensor, render_pkg, cam_uid, cam_name, cam_weight)
+        per_view_packs = []
+        for _sub in range(K):
+            if phase == "merge":
+                candidates = select_cameras_weighted(
+                    prog_scene.train_cameras, image_weights, n_top=10, n_random=10,
+                )
+                if not candidates:
+                    candidates = prog_scene.train_cameras
+                vcam = candidates[randint(0, len(candidates) - 1)]
+                cam_idx = prog_scene._cam_name_to_idx.get(vcam.image_name, 0)
+                cam_w = (float(image_weights[cam_idx])
+                         if image_weights is not None and cam_idx < len(image_weights)
+                         else 1.0)
+            else:
+                if not viewpoint_stack:
+                    viewpoint_stack = prog_scene.train_cameras.copy()
+                vcam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+                cam_idx = prog_scene._cam_name_to_idx.get(vcam.image_name, 0)
+                cam_w = 1.0
+
+            bg = torch.rand((3,), device="cuda") if opt.random_background else background
+            render_pkg = render_imp(vcam, gaussians, pipe, bg, is_training=True)
+            img = render_pkg["render"]
+            gt_image = vcam.original_image.cuda()
+
+            Ll1 = l1_loss(img, gt_image)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_val = fused_ssim(img.unsqueeze(0), gt_image.unsqueeze(0))
+            else:
+                ssim_val = ssim(img, gt_image)
+
+            base_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
+            loss_k = cam_w * base_loss if phase == "merge" else base_loss
+
+            per_view_packs.append((loss_k, render_pkg, vcam.uid, vcam.image_name, cam_w))
+
+        # ---- T8: EMA update + gate decision ----
+        if skipgs is not None:
+            for loss_t, _, cam_id, _, _ in per_view_packs:
+                skipgs.update_ema(cam_id, float(loss_t.detach()))
+            devs = [skipgs.deviation(cam_id, float(loss_t.detach()))
+                    for loss_t, _, cam_id, _, _ in per_view_packs]
+            gate, _ = skipgs.decide(devs)
         else:
-            if not viewpoint_stack:
-                viewpoint_stack = prog_scene.train_cameras.copy()
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-            cam_idx = prog_scene._cam_name_to_idx.get(viewpoint_cam.image_name, 0)
+            gate = [True] * K
 
-        # ---- Forward pass ----
-        bg = torch.rand((3,), device="cuda") if opt.random_background else background
-        render_pkg = render_imp(viewpoint_cam, gaussians, pipe, bg, is_training=True)
-        image = render_pkg["render"]
-        viewspace_point_tensor = render_pkg["viewspace_points"]
-        visibility_filter = render_pkg["visibility_filter"]
-        radii = render_pkg["radii"]
-        area_max = render_pkg["area_max"]
+        contributing = [loss_t
+                        for (loss_t, _, _, _, _), g in zip(per_view_packs, gate) if g]
 
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
+        if not contributing:
+            # Fully-skipped step — update visibility stats only, no backward/step
+            if skipgs is not None:
+                skipgs.record_backward(False)
+            with torch.no_grad():
+                for _, render_pkg, _, _, _ in per_view_packs:
+                    vf = render_pkg["visibility_filter"]
+                    rad = render_pkg["radii"]
+                    gaussians.max_radii2D[vf] = torch.max(gaussians.max_radii2D[vf], rad[vf])
+                    am = render_pkg["area_max"]
+                    ri = render_pkg["render"]
+                    mbp = torch.zeros(gaussians._xyz.shape[0], device="cuda")
+                    if mask_blur.shape[0] <= gaussians._xyz.shape[0]:
+                        mbp[:mask_blur.shape[0]] = mask_blur
+                    mask_blur = torch.logical_or(mbp, am > (ri.shape[1] * ri.shape[2] / 5000))
+            continue
 
-        base_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-
-        # Phase 6: scale loss by camera weight in merge phase
-        if phase == "merge" and image_weights is not None and cam_idx < len(image_weights):
-            w = float(image_weights[cam_idx])
-            loss = w * base_loss
-        else:
-            loss = base_loss
-
-        # OptimizingSpa regulariser (final phase only)
-        if phase == "final" and opt.optimizing_spa:
-            if (optimizingSpa is not None
-                    and phase_iter > optimizing_spa_start_iter
-                    and phase_iter % training_cfg.optimizing_spa_interval == 0
-                    and phase_iter < optimizing_spa_stop_iter):
-                loss = optimizingSpa.append_spa_loss(loss)
-            if (optimizingSpaSg is not None
-                    and phase_iter > optimizing_spa_sg_start_iter
-                    and phase_iter % training_cfg.optimizing_spa_interval == 0
-                    and phase_iter < optimizing_spa_sg_stop_iter):
-                loss = optimizingSpaSg.append_spa_loss_sg(loss)
-
+        # ---- Backward (sum of contributing views) ----
+        loss = sum(contributing)
         loss.backward()
 
-        # ---- Diary logging (Phase 6) ----
-        if phase == "merge" and diary_file is not None:
-            w_log = float(image_weights[cam_idx]) if (image_weights is not None and cam_idx < len(image_weights)) else 1.0
-            diary_file.write(f"iter={global_iter} cam={viewpoint_cam.image_name} weight={w_log:.4f}\n")
+        if skipgs is not None:
+            skipgs.record_backward(True)
 
+        # ---- Diary logging (merge phase lists all K cameras) ----
+        if phase == "merge" and diary_file is not None:
+            cam_line = ",".join(f"{name}:{w:.3f}" for _, _, _, name, w in per_view_packs)
+            diary_file.write(f"iter={global_iter} cams=[{cam_line}]\n")
+
+        # ---- no_grad: stats, T7 triggers, convergence check ----
         with torch.no_grad():
+            # Advance settling countdown (pure Python, no GPU sync).
+            n_contributing = sum(gate)
+            if densify_settle_views > 0:
+                densify_settle_views = max(0, densify_settle_views - n_contributing)
+
             ema_loss = 0.4 * loss.item() + 0.6 * ema_loss
             if phase_iter % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss:.7f}",
                                           "N": gaussians._xyz.shape[0]})
                 progress_bar.update(10)
 
-            # ---- Densification (initial and merge phases; lighter in merge) ----
-            densify_interval = (
-                training_cfg.merge_densification_interval
-                if phase == "merge" else opt.densification_interval
-            )
-            if phase in ("initial", "merge") and gaussians._xyz.shape[0] < training_cfg.num_max:
-                gaussians.max_radii2D[visibility_filter] = torch.max(
-                    gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            monitor.update_loss(ema_loss)
 
-                mask_blur_padded = torch.zeros(gaussians._xyz.shape[0], device="cuda")
+            # Densification stats: visibility for all K views; gradient only for contributors
+            for (_, render_pkg, _, _, _), g in zip(per_view_packs, gate):
+                vf = render_pkg["visibility_filter"]
+                rad = render_pkg["radii"]
+                am = render_pkg["area_max"]
+                ri = render_pkg["render"]
+
+                gaussians.max_radii2D[vf] = torch.max(gaussians.max_radii2D[vf], rad[vf])
+
+                mbp = torch.zeros(gaussians._xyz.shape[0], device="cuda")
                 if mask_blur.shape[0] <= gaussians._xyz.shape[0]:
-                    mask_blur_padded[:mask_blur.shape[0]] = mask_blur
-                mask_blur = mask_blur_padded
-                mask_blur = torch.logical_or(
-                    mask_blur,
-                    area_max > (image.shape[1] * image.shape[2] / 5000)
+                    mbp[:mask_blur.shape[0]] = mask_blur
+                mask_blur = torch.logical_or(mbp, am > (ri.shape[1] * ri.shape[2] / 5000))
+
+                if g:  # T8: only accumulate gradient stats for views that contributed
+                    gaussians.add_densification_stats(render_pkg["viewspace_points"], vf)
+
+            # T7: fast opacity/size prune every iter (cheap)
+            if should_fast_prune(gaussians, opt, training_cfg.fast_prune_dead_fraction):
+                gaussians.opacity_size_prune(
+                    min_opacity=0.005,
+                    max_screen_size=20 if phase == "initial" else None,
+                    extent=prog_scene.cameras_extent,
                 )
 
-                if (phase_iter > opt.densify_from_iter
-                        and phase_iter % densify_interval == 0):
+            # T7: evidence-based densify.
+            # Outer guard is pure Python (densify_settle_views countdown) — no GPU sync
+            # unless the predicate is actually worth evaluating.
+            if densify_settle_views == 0 and gaussians._xyz.shape[0] < training_cfg.num_max_ceiling:
+                if should_densify(gaussians, opt, mask_blur,
+                                  candidate_fraction=training_cfg.densify_candidate_fraction,
+                                  min_obs=training_cfg.densify_min_obs):
+                    n_before = gaussians._xyz.shape[0]
                     size_threshold = 20 if phase == "initial" else None
                     gaussians.densify_and_prune_split(
                         opt.densify_grad_threshold,
@@ -573,156 +683,57 @@ def train_window(
                         size_threshold,
                         mask_blur[:gaussians.xyz_gradient_accum.shape[0]],
                     )
+                    n_after = gaussians._xyz.shape[0]
+                    n_added = max(n_after - n_before, 0)
+                    monitor.update_densify(n_added, n_after)
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
+                    # Start settling countdown: wait min_obs contributing views before re-evaluating.
+                    # evidence_settled() inside should_densify verifies actual per-Gaussian counts.
+                    densify_settle_views = training_cfg.densify_min_obs
 
-            # ---- Final-phase MEGS-2 full schedule ----
-            if phase == "final":
-                if phase_iter < opt.densify_until_iter:
-                    gaussians.max_radii2D[visibility_filter] = torch.max(
-                        gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                    mask_blur_padded = torch.zeros(gaussians._xyz.shape[0], device="cuda")
-                    if mask_blur.shape[0] <= gaussians._xyz.shape[0]:
-                        mask_blur_padded[:mask_blur.shape[0]] = mask_blur
-                    mask_blur = mask_blur_padded
-                    mask_blur = torch.logical_or(
-                        mask_blur,
-                        area_max > (image.shape[1] * image.shape[2] / 5000)
-                    )
-                    if (phase_iter > opt.densify_from_iter
-                            and phase_iter % opt.densification_interval == 0
-                            and phase_iter % 5000 != 0
-                            and gaussians._xyz.shape[0] < training_cfg.num_max):
-                        size_threshold = 20 if phase_iter > opt.opacity_reset_interval else None
-                        gaussians.densify_and_prune_split(
-                            opt.densify_grad_threshold,
-                            0.005,
-                            prog_scene.cameras_extent,
-                            size_threshold,
-                            mask_blur[:gaussians.xyz_gradient_accum.shape[0]],
-                        )
-                        mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
+            # T7: lightweight importance prune — fire when monitor says stalled/converged
+            if phase != "initial" and monitor.state() in ("stalled", "converged"):
+                if should_lightweight_prune(gaussians, monitor,
+                                            n_at_last_prune, soft_cap,
+                                            growth_threshold=training_cfg.lightweight_prune_growth_threshold):
+                    lightweight_prune(gaussians, prog_scene, opt, config, global_iter)
+                    n_at_last_prune = gaussians._xyz.shape[0]
 
-                # Depth-based reinit (final phase only, never in merge to protect new Gaussians)
-                if phase_iter % 5000 == 0:
-                    out_pts_list, gt_list = [], []
-                    views = prog_scene.train_cameras
-                    for view in views:
-                        gt = view.original_image[0:3, :, :]
-                        rdpkg = render_depth(view, gaussians, pipe, background)
-                        out_pts = rdpkg["out_pts"]
-                        accum_alpha = rdpkg["accum_alpha"]
-                        prob = 1 - accum_alpha
-                        prob = prob / prob.sum()
-                        prob = prob.reshape(-1).cpu().numpy()
-                        factor = 1 / (
-                            image.shape[1] * image.shape[2] * len(views)
-                            / getattr(opt, 'num_depth', 3_500_000)
-                        )
-                        N_xyz = prob.shape[0]
-                        num_sampled = int(N_xyz * factor)
-                        indices = np.random.choice(N_xyz, size=num_sampled, p=prob, replace=False)
-                        out_pts = out_pts.permute(1, 2, 0).reshape(-1, 3)
-                        gt = gt.permute(1, 2, 0).reshape(-1, 3)
-                        out_pts_list.append(out_pts[indices])
-                        gt_list.append(gt[indices])
-                    out_pts_merged = torch.cat(out_pts_list)
-                    gt_merged = torch.cat(gt_list)
-                    gaussians.reinitial_pts(out_pts_merged, gt_merged)
-                    gaussians.training_setup(opt)
-                    mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
-                    torch.cuda.empty_cache()
-                    viewpoint_stack = None
+            # T7: late-phase SG axis cull (final phase only, triggered once at 85%+)
+            if (phase == "final"
+                    and phase_iter > n_iters * 0.85
+                    and not has_culled
+                    and should_cull_sg_axes(gaussians, training_cfg.sharpness_threshold,
+                                           fraction_low=training_cfg.sg_axis_cull_low_fraction)):
+                gaussians.cull_low_sharpness_axes(
+                    sharpness_threshold=training_cfg.sharpness_threshold)
+                has_culled = True
+                torch.cuda.empty_cache()
+                logger.info(f"[{phase}] SG axis cull triggered at iter {phase_iter}")
 
-                # OptimizingSpa init
-                if opt.optimizing_spa:
-                    if phase_iter == optimizing_spa_start_iter:
-                        imp_score = update_imp_score(
-                            prog_scene.train_cameras, gaussians, pipe, background,
-                            imp_metric=training_cfg.imp_metric,
-                        )
-                        optimizingSpa = OptimizingSpa(
-                            gaussians, opt, "cuda", imp_score_flag=True)
-                        optimizingSpa.update(imp_score, update_u=False)
+            # T7: convergence-driven early termination
+            converged = monitor.state() == "converged"
 
-                    if phase_iter == optimizing_spa_sg_start_iter:
-                        imp_sg_score = update_sg_color_diff(gaussians)
-                        optimizingSpaSg = OptimizingSpaSG(
-                            gaussians, opt, "cuda", imp_score_flag=True)
-                        optimizingSpaSg.update(imp_sg_score, update_u=False)
+        if converged:
+            logger.info(f"[{phase}] converged at iter {phase_iter}/{n_iters}")
+            break
 
-                    if (phase_iter > optimizing_spa_start_iter
-                            and phase_iter % training_cfg.optimizing_spa_interval == 0):
-                        if phase_iter <= optimizing_spa_stop_iter and optimizingSpa is not None:
-                            imp_score = update_imp_score(
-                                prog_scene.train_cameras, gaussians, pipe, background,
-                                imp_metric=training_cfg.imp_metric,
-                            )
-                            optimizingSpa.update(imp_score)
-                        if phase_iter <= optimizing_spa_sg_stop_iter and optimizingSpaSg is not None:
-                            imp_sg_score = update_sg_color_diff(gaussians)
-                            optimizingSpaSg.update(imp_sg_score)
+        # Optimizer step (skip on the very last cap-terminated iter for consistency)
+        if phase_iter < n_iters:
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
 
-                # Prune at simp_iteration1
-                if phase_iter == simp_iteration1:
-                    imp_score = update_imp_score(
-                        prog_scene.train_cameras, gaussians, pipe, background,
-                        imp_metric=training_cfg.imp_metric,
-                    )
-                    grace_mask = gaussians.get_grace_protected_mask(global_iter)
-                    prob = (imp_score + 1) / (imp_score + 1).sum()
-                    prob = prob.cpu().numpy()
-                    N_xyz = gaussians._xyz.shape[0]
-                    num_sampled = int(N_xyz * (1 - training_cfg.prune_ratio1))
-                    indices = np.random.choice(N_xyz, size=num_sampled, p=prob, replace=False)
-                    mask = np.zeros(N_xyz, dtype=bool)
-                    mask[indices] = True
-                    # Never prune grace-protected Gaussians
-                    grace_np = grace_mask.cpu().numpy()
-                    mask = mask | grace_np
-                    gaussians.prune_points(mask == False)
-                    gaussians.max_sg_degree = gaussians.max_sg_degree
-                    gaussians.reinitial_pts(gaussians._xyz, SH2RGB(gaussians._rgb_base))
-                    gaussians.training_setup(opt)
-                    optimizingSpa = None
-                    optimizingSpaSg = None
-                    torch.cuda.empty_cache()
-                    viewpoint_stack = None
-
-                # Second prune at optimizing_spa_stop_iter
-                if phase_iter == optimizing_spa_stop_iter:
-                    imp_score = update_imp_score(
-                        prog_scene.train_cameras, gaussians, pipe, background,
-                        imp_metric=training_cfg.imp_metric,
-                    )
-                    grace_mask = gaussians.get_grace_protected_mask(global_iter)
-                    threshold = int(training_cfg.prune_ratio2 * imp_score.shape[0])
-                    imp_sorted, _ = torch.sort(imp_score, 0)
-                    imp_threshold = imp_sorted[max(threshold - 1, 0)]
-                    prune_mask = (imp_score <= imp_threshold).squeeze()
-                    # Protect grace-period Gaussians
-                    prune_mask = prune_mask & ~grace_mask
-                    logger.info(f"[final] Before 2nd prune: {gaussians.get_opacity.shape[0]}")
-                    gaussians.prune_points(prune_mask)
-                    logger.info(f"[final] After 2nd prune: {gaussians.get_opacity.shape[0]}")
-                    optimizingSpa = None
-                    optimizingSpaSg = None
-                    torch.cuda.empty_cache()
-
-                # SG axis culling
-                if phase_iter == optimizing_spa_sg_stop_iter:
-                    logger.info(f"[final] SG axis culling (threshold={training_cfg.sharpness_threshold})")
-                    gaussians.cull_low_sharpness_axes(
-                        sharpness_threshold=training_cfg.sharpness_threshold)
-                    torch.cuda.empty_cache()
-
-            # ---- Optimizer step ----
-            if phase_iter < n_iters:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none=True)
+    # T8: per-phase SkipGS summary
+    if skipgs is not None and skipgs._step > 0:
+        rho_cum = skipgs._backward_count / max(skipgs._step, 1)
+        logger.info(
+            f"[skipgs] rho_min={skipgs._rho_min:.3f} "
+            f"steps={skipgs._step} backward={skipgs._backward_count} "
+            f"rho_cum={rho_cum:.3f}"
+        )
 
     progress_bar.close()
-    return n_iters
+    return phase_iter  # actual iterations consumed
 
 
 # ---------------------------------------------------------------------------
@@ -734,9 +745,12 @@ def lightweight_prune(gaussians, prog_scene, opt, config, global_iter):
     logger.info("[prune] Running lightweight prune pass")
     pipe_dummy = Namespace(convert_SHs_python=False, compute_cov3D_python=False, debug=False)
     background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+    subsample_n = config.training.imp_score_camera_subsample
     imp_score = update_imp_score(
         prog_scene.train_cameras, gaussians, pipe_dummy, background,
         imp_metric=config.training.imp_metric,
+        subsample_n=subsample_n,
+        weights=prog_scene.image_weights,
     )
     grace_mask = gaussians.get_grace_protected_mask(global_iter)
     threshold = int(config.training.prune_ratio1 * imp_score.shape[0])
@@ -749,6 +763,35 @@ def lightweight_prune(gaussians, prog_scene, opt, config, global_iter):
     after = gaussians._xyz.shape[0]
     logger.info(f"[prune] {before} → {after} Gaussians")
     torch.cuda.empty_cache()
+
+
+def fast_final_compression(gaussians, prog_scene, opt, pipe, config, global_iter):
+    """Single-shot importance prune + SG axis cull after the final phase.
+
+    Replaces the historical destructive reinitial_pts reset + reconverge pass.
+    Runs once after the convergence-driven final phase exits.
+    """
+    pipe_dummy = Namespace(convert_SHs_python=False, compute_cov3D_python=False, debug=False)
+    background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
+    subsample_n = config.training.imp_score_camera_subsample
+    imp_score = update_imp_score(
+        prog_scene.train_cameras, gaussians, pipe_dummy, background,
+        imp_metric=config.training.imp_metric,
+        subsample_n=subsample_n,
+        weights=prog_scene.image_weights,
+    )
+    grace_mask = gaussians.get_grace_protected_mask(global_iter)
+    ratio = config.training.fast_final_prune_ratio
+    threshold = int(ratio * imp_score.shape[0])
+    imp_sorted, _ = torch.sort(imp_score, 0)
+    cutoff = imp_sorted[max(threshold - 1, 0)]
+    prune_mask = (imp_score <= cutoff).squeeze() & ~grace_mask
+    n_before = gaussians._xyz.shape[0]
+    gaussians.prune_points(prune_mask)
+    gaussians.cull_low_sharpness_axes(
+        sharpness_threshold=config.training.sharpness_threshold)
+    torch.cuda.empty_cache()
+    logger.info(f"[fast-final] {n_before} → {gaussians._xyz.shape[0]} Gaussians, SG axes culled")
 
 
 # ---------------------------------------------------------------------------
@@ -783,12 +826,19 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
     gaussians.create_from_pcd(prog_scene.current_basic_pcd, prog_scene.cameras_extent)
     gaussians.training_setup(opt)
 
+    # T4: optionally open DAv2 once and hold it for all snapshots
+    _persistent_dav2 = None
+    if config.dense_init.persist_model:
+        logger.info("[dense-init] T4: opening persistent DAv2 model ...")
+        _persistent_dav2 = DepthAnythingV2Wrapper(config.dense_init.dav2).__enter__()
+
     # Dense init for the initial snapshot (same logic as merge phase)
     if config.dense_init.enabled and new_cams:
         logger.info(f"[dense_init] Running on initial {len(new_cams)} cameras ...")
         dense_init_for_new_images(
             gaussians, prog_scene, new_cams,
             config.dense_init, opt, current_iter=0,
+            dav2_model=_persistent_dav2,
         )
 
     bg_white = getattr(dataset, 'white_background', False)
@@ -831,6 +881,7 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
             dense_init_for_new_images(
                 gaussians, prog_scene, new_cams,
                 config.dense_init, opt, current_iter=global_iter,
+                dav2_model=_persistent_dav2,
             )
 
         # Phase 6: parse match matrix and compute image weights
@@ -868,16 +919,24 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
             bg_white=bg_white,
         )
 
-        # Phase 7: lightweight prune every N snapshots
-        if snapshot_count % config.training.prune_every_n_snapshots == 0:
+        # T7: cap-breach safety valve (replaces prune_every_n_snapshots)
+        soft_cap = int(config.training.num_max_ceiling * 0.85)
+        if gaussians._xyz.shape[0] > soft_cap:
             lightweight_prune(gaussians, prog_scene, opt, config, global_iter)
 
         if config.snapshots.progressive_output:
             save_checkpoint(model_path, gaussians, snapshot_idx=snap_idx)
 
+    # T4: free persistent DAv2 before final phase (reclaim ~1.3 GB VRAM)
+    if _persistent_dav2 is not None:
+        _persistent_dav2.__exit__(None, None, None)
+        _persistent_dav2 = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("[dense-init] T4: released persistent DAv2 model before final phase")
+
     # ---- Final refinement phase ----
-    logger.info(f"[final] Starting final refinement ({config.training.iter_final} iters) ...")
-    # Reset LR schedule for final phase
+    logger.info(f"[final] Starting final refinement (cap={config.training.iter_final} iters) ...")
     gaussians.update_learning_rate(0)
 
     global_iter += train_window(
@@ -888,6 +947,10 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
         diary_file=diary_file,
         bg_white=bg_white,
     )
+
+    # T7: fast final compression — single-shot importance prune + SG axis cull
+    logger.info("[final] Running fast_final_compression ...")
+    fast_final_compression(gaussians, prog_scene, opt, pipe, config, global_iter)
 
     save_checkpoint(model_path, gaussians, snapshot_idx="final")
     diary_file.close()

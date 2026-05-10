@@ -2,42 +2,64 @@
 # All tunables live here; CLI args are paths + debug flags only.
 
 training:
-  iter_initial: 3000          # iterations on snapshot 0 before progressive loop
-  iter_per_merge: 200         # iterations per new image in a merge phase
-  iter_final: 4000            # final refinement iterations
-  num_max: 800000             # Gaussian count ceiling for 6 GB GPU
-  prune_every_n_snapshots: 5  # lightweight prune interval during merge phases
+  # Iteration caps — safety belt only; convergence drives early termination (T7).
+  iter_initial: 3000          # cap, not target
+  iter_per_merge: 200         # cap, not target
+  iter_final: 4000            # cap, not target
 
-  # MEGS-2 pruning schedule (applied to final-refinement phase, scaled to iter_final)
-  simp_iteration1_frac: 0.40           # → simp_iteration1 = iter_final * frac
-  optimizing_spa_start_iter_frac: 0.50
-  optimizing_spa_stop_iter_frac: 0.80
-  optimizing_spa_sg_stop_iter_frac: 0.95
+  # Single hard Gaussian ceiling (VRAM-bounded). No floor/step/ramp (T7).
+  num_max_ceiling: 800000     # was: num_max
+
+  # MEGS-2 pruning ratios (used by lightweight_prune and fast_final_compression)
   prune_ratio1: 0.05
   prune_ratio2: 0.05
   sharpness_threshold: 1.0
-  optimizing_spa_interval: 100
 
-  # Merge-phase densification interval (slower than initial; protect recently added Gaussians)
-  merge_densification_interval: 100
-
-  # Importance metric: "outdoor" or "indoor" (passed to update_imp_score)
+  # Importance metric: "outdoor" or "indoor"
   imp_metric: outdoor
+
+  # T5: camera subsample in update_imp_score (0 = all cameras, default off)
+  imp_score_camera_subsample: 0
+
+  # T6: multi-view gradient accumulation (1 = original single-view behaviour)
+  accumulation_views: 2
+
+  # T7: trigger predicate knobs (expose for calibration)
+  densify_min_obs: 10
+  densify_candidate_fraction: 0.005
+  fast_prune_dead_fraction: 0.02
+  lightweight_prune_growth_threshold: 0.10
+  sg_axis_cull_low_fraction: 0.20
+
+  # T7: fast final compression (single-shot post-phase importance prune + axis cull)
+  fast_final_prune_ratio: 0.10
+
+  # T8: SkipGS — view-adaptive backward gating (final phase only)
+  skipgs:
+    enabled: true
+    phase: final          # only activate in this phase
+    warmup: 500
+    beta: 0.95
+    eps: 1.0e-8
+    rho_lo: 0.5
 
 dense_init:
   enabled: true
-  skip_first_n_snapshots: 3           # let SfM stabilise before trusting alignment
+  skip_first_n_snapshots: 0           # was 3; snapshot 1 now gets dense init (T3)
 
   min_sfm_points_for_alignment: 10    # below this, skip dense init for this image
   min_sfm_depth_range_fraction: 0.10  # SfM depths must span >=10% of scene scale
-  target_dense_points_per_image: 50000
+  target_dense_points_per_image: 100000   # was 50000 (T3: denser init)
   novelty_distance_threshold: 0.01    # in units of cameras_extent
   depth_disagreement_threshold: 0.10  # fraction of scene scale
   max_rejected_fraction: 0.5
   grace_iters: 200                    # protect dense Gaussians from pruning this long
 
+  # T4: hold DAv2 across snapshots (saves ~30 s/snapshot load; costs ~1.3 GB VRAM)
+  persist_model: false                # default off; set true to opt in
+
   dav2:
-    model_size: small                 # small | base | large
+    model_size: large                 # was small; 4.5 GB headroom supports large (T3)
     input_resolution: 518
     device: cuda
     fp16: true
