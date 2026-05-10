@@ -696,11 +696,11 @@ def train_window(
                 if should_lightweight_prune(gaussians, monitor,
                                             n_at_last_prune, soft_cap,
                                             growth_threshold=training_cfg.lightweight_prune_growth_threshold):
+                    n_before_prune = gaussians._xyz.shape[0]
                     lightweight_prune(gaussians, prog_scene, opt, config, global_iter)
                     n_at_last_prune = gaussians._xyz.shape[0]
-                    # Scene changed significantly — old slope estimate is stale.
-                    # Clear history so convergence can't fire in the same iteration.
-                    monitor.loss_history.clear()
+                    fraction_pruned = (n_before_prune - n_at_last_prune) / max(n_before_prune, 1)
+                    monitor.reset(fraction_changed=fraction_pruned)
 
             # T7: late-phase SG axis cull (final phase only, triggered once at 85%+)
             if (phase == "final"
