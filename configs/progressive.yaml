@@ -29,8 +29,10 @@ training:
   densify_min_settling: 50
   densify_max_interval: 500
   densify_candidate_fraction: 0.005
+  densify_check_interval: 50          # how often to evaluate should_densify (iters)
   fast_prune_dead_fraction: 0.02
   lightweight_prune_growth_threshold: 0.10
+  lightweight_prune_check_interval: 200  # how often to evaluate should_lightweight_prune (iters)
   sg_axis_cull_low_fraction: 0.20
 
   # T7: fast final compression (single-shot post-phase importance prune + axis cull)
