@@ -26,8 +26,6 @@ training:
 
   # T7: trigger predicate knobs (expose for calibration)
   densify_min_obs: 10
-  densify_min_settling: 50
-  densify_max_interval: 500
   densify_candidate_fraction: 0.005
   fast_prune_dead_fraction: 0.02
   lightweight_prune_growth_threshold: 0.10

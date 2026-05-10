@@ -11,17 +11,14 @@ def evidence_settled(gaussians, min_obs=10, min_seen_fraction=0.5):
 
 
 def should_densify(gaussians, opt, mask_blur,
-                   last_densify_iter, current_iter,
-                   min_settling=50,
                    candidate_fraction=0.005,
-                   max_interval=500):
-    """Fire densify when per-Gaussian gradient evidence shows enough candidates,
-    or as a stale-flush after max_interval iters."""
-    if current_iter - last_densify_iter < min_settling:
-        return False
-    if current_iter - last_densify_iter > max_interval:
-        return True  # force-flush stale grad accum
-    if not evidence_settled(gaussians):
+                   min_obs=10):
+    """Fire densify when per-Gaussian gradient evidence shows enough candidates.
+
+    Settling (post-densify cool-off) is handled externally by tracking denom.sum()
+    rather than iteration counts — see train_window's densify_denom_settled.
+    """
+    if not evidence_settled(gaussians, min_obs=min_obs):
         return False
     grads = gaussians.xyz_gradient_accum / gaussians.denom.clamp(min=1)
     n_clone = (grads.squeeze() >= opt.densify_grad_threshold).sum().item()

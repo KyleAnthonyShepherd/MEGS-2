@@ -103,8 +103,6 @@ class TrainingConfig:
 
     # T7: trigger predicate knobs
     densify_min_obs: int = 10
-    densify_min_settling: int = 50
-    densify_max_interval: int = 500
     densify_candidate_fraction: float = 0.005
     fast_prune_dead_fraction: float = 0.02
     lightweight_prune_growth_threshold: float = 0.10
@@ -500,7 +498,9 @@ def train_window(
 
     # T7: convergence monitor + trigger state
     monitor = ConvergenceMonitor()
-    last_densify_iter = 0
+    # Settling guard: don't re-evaluate densify until new Gaussians have been observed.
+    # Tracks denom.sum() target rather than iteration count.
+    densify_denom_settled = 0.0
     n_at_last_prune = gaussians._xyz.shape[0]
     has_culled = False
     soft_cap = int(training_cfg.num_max_ceiling * 0.85)
@@ -661,13 +661,13 @@ def train_window(
                     extent=prog_scene.cameras_extent,
                 )
 
-            # T7: evidence-based densify — checked every iter (predicate has min_settling floor)
-            if gaussians._xyz.shape[0] < training_cfg.num_max_ceiling:
+            # T7: evidence-based densify.
+            # Settling guard: skip until new Gaussians have accumulated enough observations.
+            if (gaussians._xyz.shape[0] < training_cfg.num_max_ceiling
+                    and gaussians.denom.sum().item() >= densify_denom_settled):
                 if should_densify(gaussians, opt, mask_blur,
-                                  last_densify_iter, phase_iter,
-                                  min_settling=training_cfg.densify_min_settling,
                                   candidate_fraction=training_cfg.densify_candidate_fraction,
-                                  max_interval=training_cfg.densify_max_interval):
+                                  min_obs=training_cfg.densify_min_obs):
                     n_before = gaussians._xyz.shape[0]
                     size_threshold = 20 if phase == "initial" else None
                     gaussians.densify_and_prune_split(
@@ -678,9 +678,11 @@ def train_window(
                         mask_blur[:gaussians.xyz_gradient_accum.shape[0]],
                     )
                     n_after = gaussians._xyz.shape[0]
-                    monitor.update_densify(n_after - n_before, n_after)
+                    n_added = max(n_after - n_before, 0)
+                    monitor.update_densify(n_added, n_after)
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
-                    last_densify_iter = phase_iter
+                    # New Gaussians must accumulate min_obs observations before re-evaluating
+                    densify_denom_settled = gaussians.denom.sum().item() + training_cfg.densify_min_obs * n_added
 
             # T7: lightweight importance prune — fire when monitor says stalled/converged
             if phase != "initial" and monitor.state() in ("stalled", "converged"):
