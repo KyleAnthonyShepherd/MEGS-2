@@ -106,10 +106,8 @@ class TrainingConfig:
     densify_min_settling: int = 50
     densify_max_interval: int = 500
     densify_candidate_fraction: float = 0.005
-    densify_check_interval: int = 50      # how often to evaluate should_densify (iters)
     fast_prune_dead_fraction: float = 0.02
     lightweight_prune_growth_threshold: float = 0.10
-    lightweight_prune_check_interval: int = 200  # how often to evaluate should_lightweight_prune (iters)
     sg_axis_cull_low_fraction: float = 0.20
 
     # T7: fast final compression ratio
@@ -663,9 +661,8 @@ def train_window(
                     extent=prog_scene.cameras_extent,
                 )
 
-            # T7: evidence-based densify (gated by ceiling)
-            if (phase_iter % training_cfg.densify_check_interval == 0
-                    and gaussians._xyz.shape[0] < training_cfg.num_max_ceiling):
+            # T7: evidence-based densify — checked every iter (predicate has min_settling floor)
+            if gaussians._xyz.shape[0] < training_cfg.num_max_ceiling:
                 if should_densify(gaussians, opt, mask_blur,
                                   last_densify_iter, phase_iter,
                                   min_settling=training_cfg.densify_min_settling,
@@ -685,8 +682,8 @@ def train_window(
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
                     last_densify_iter = phase_iter
 
-            # T7: lightweight importance prune (non-initial phases)
-            if phase_iter % training_cfg.lightweight_prune_check_interval == 0 and phase != "initial":
+            # T7: lightweight importance prune — fire when monitor says stalled/converged
+            if phase != "initial" and monitor.state() in ("stalled", "converged"):
                 if should_lightweight_prune(gaussians, monitor,
                                             n_at_last_prune, soft_cap,
                                             growth_threshold=training_cfg.lightweight_prune_growth_threshold):
