@@ -62,7 +62,7 @@ dense_init:
     model_size: large                 # was small; 4.5 GB headroom supports large (T3)
     input_resolution: 518
     device: cuda
-    fp16: true
+    fp16: false
 
   ransac:
     iterations: 200
