@@ -135,10 +135,13 @@ class DepthAnythingV2Wrapper:
             outputs = self.model(**inputs)
         # predicted_depth shape: (1, H', W')
         depth = outputs.predicted_depth  # relative disparity
+        # Sanitize before interpolation: fp16 can overflow to inf in sky/textureless
+        # regions, and bilinear interp spreads nan from any inf neighbour.
+        depth = _torch.nan_to_num(depth.float(), nan=0.0, posinf=0.0, neginf=0.0)
         # Resize back to original image size
         H_orig, W_orig = image_chw.shape[1], image_chw.shape[2]
         depth = _torch.nn.functional.interpolate(
-            depth.unsqueeze(1).float(),
+            depth.unsqueeze(1),
             size=(H_orig, W_orig),
             mode="bilinear",
             align_corners=False,
@@ -229,12 +232,16 @@ def align_depth_to_sfm(
     z_pred = depth_map[v_valid, u_valid].numpy().astype(np.float64)
     z_sfm = z_true[valid]
 
-    # Remove non-finite predicted depths
+    # Remove non-finite predicted depths (zeros come from nan_to_num sanitization in predict())
     finite_mask = np.isfinite(z_pred) & (z_pred != 0)
+    n_total, n_finite = len(z_pred), finite_mask.sum()
     z_pred = z_pred[finite_mask]
     z_sfm = z_sfm[finite_mask]
     if len(z_pred) < 2:
-        raise AlignmentFailed("Insufficient finite predicted-depth samples")
+        raise AlignmentFailed(
+            f"Insufficient finite predicted-depth samples "
+            f"({n_finite}/{n_total} SfM-projection pixels have valid depth)"
+        )
 
     inlier_thresh = cfg.inlier_threshold * scene_scale
     best_n_inliers = 0
