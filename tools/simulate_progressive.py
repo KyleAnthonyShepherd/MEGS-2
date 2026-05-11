@@ -48,6 +48,7 @@ Each snapshot N is a strict cumulative superset of snapshot N-1.
 """
 
 import argparse
+import json
 import os
 import struct
 import sys
@@ -405,26 +406,61 @@ def build_snapshots(source: Path, output: Path, n_init: int, step: int,
         print(f"  snap {snap_num:3d}: {len(images_in_snap):4d} images, "
               f"{len(points_in_snap):6d} 3D points → {snap_dir}")
 
-    print(f"\nDone. Run progressive training with:")
-    print(f"  python progressive_train.py \\")
-    print(f"    --source_path_dir {output} \\")
+    print(f"\nDone. Start continuous training, then feed snapshots:")
+    print(f"  python continuous_train.py \\")
     print(f"    --model_path /path/to/output \\")
-    print(f"    --config configs/progressive.yaml")
+    print(f"    --config configs/continuous.yaml")
+    print()
+    print(f"  # Then post each snapshot in order, e.g.:")
+    print(f"  python tools/simulate_progressive.py --post-snapshots {output} --server http://127.0.0.1:8765")
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+def post_snapshots(snapshot_root: Path, server_url: str, delay: float):
+    """POST each numbered snapshot directory to a running continuous_train server."""
+    import urllib.request
+    import time as _time
+
+    snap_dirs = sorted(
+        [snapshot_root / d for d in os.listdir(snapshot_root)
+         if (snapshot_root / d).is_dir() and d.isdigit()],
+        key=lambda p: int(p.name),
+    )
+    if not snap_dirs:
+        sys.exit(f"No numbered snapshot directories found in {snapshot_root}")
+
+    url = server_url.rstrip("/") + "/ingest"
+    for snap_dir in snap_dirs:
+        body = json.dumps({"snapshot_dir": str(snap_dir.resolve())}).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+            print(f"  POSTed {snap_dir.name} → request_id={result.get('request_id')}")
+        except Exception as e:
+            print(f"  ERROR posting {snap_dir.name}: {e}", file=sys.stderr)
+        if delay > 0:
+            _time.sleep(delay)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Slice a COLMAP reconstruction into progressive training snapshots.",
+        description="Slice a COLMAP reconstruction into progressive training snapshots "
+                    "or feed existing snapshots to a running continuous_train server.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--source", required=True, type=Path,
+    # Slice mode
+    parser.add_argument("--source", type=Path, default=None,
                         help="COLMAP dataset root (contains sparse/0/) or sparse/0/ directly")
-    parser.add_argument("--output", required=True, type=Path,
+    parser.add_argument("--output", type=Path, default=None,
                         help="Output directory for numbered snapshot folders")
     parser.add_argument("--n-init", type=int, default=3, metavar="N",
                         help="Images in the first snapshot (default: 3)")
@@ -435,11 +471,24 @@ def main():
     parser.add_argument("--max-snapshots", type=int, default=0, metavar="N",
                         help="Stop after N snapshots (default: all)")
     parser.add_argument("--undistort", action="store_true",
-                        help="Run colmap image_undistorter if cameras are not PINHOLE. "
-                             "Requires 'colmap' on PATH.")
+                        help="Run colmap image_undistorter if cameras are not PINHOLE.")
     parser.add_argument("--max-image-size", type=int, default=1920, metavar="PX",
-                        help="Max image dimension passed to colmap image_undistorter (default: 1920)")
+                        help="Max image dimension for undistortion (default: 1920)")
+    # Post mode
+    parser.add_argument("--post-snapshots", type=Path, default=None, metavar="DIR",
+                        help="Directory of numbered snapshots to POST to a running server")
+    parser.add_argument("--server", type=str, default="http://127.0.0.1:8765",
+                        help="continuous_train server URL (default: http://127.0.0.1:8765)")
+    parser.add_argument("--delay", type=float, default=0.0,
+                        help="Seconds to wait between POST requests (default: 0)")
     args = parser.parse_args()
+
+    if args.post_snapshots is not None:
+        post_snapshots(args.post_snapshots, args.server, args.delay)
+        return
+
+    if args.source is None or args.output is None:
+        parser.error("--source and --output are required for slice mode")
 
     args.output.mkdir(parents=True, exist_ok=True)
     build_snapshots(args.source, args.output, args.n_init, args.step,
