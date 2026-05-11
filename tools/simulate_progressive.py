@@ -219,8 +219,12 @@ def _natural_key(s):
 # Core slicing logic
 # ---------------------------------------------------------------------------
 
+_PINHOLE_MODEL_IDS = {0, 1}  # SIMPLE_PINHOLE, PINHOLE
+
+
 def find_sparse_dir(source: Path) -> Path:
-    for candidate in [source / "sparse" / "0", source]:
+    # colmap image_undistorter writes to sparse/ (no 0/ subdir); handle both layouts
+    for candidate in [source / "sparse" / "0", source / "sparse", source]:
         if (candidate / "cameras.bin").exists() or (candidate / "cameras.txt").exists():
             return candidate
     raise FileNotFoundError(
@@ -229,8 +233,52 @@ def find_sparse_dir(source: Path) -> Path:
     )
 
 
+def needs_undistortion(cameras: dict) -> bool:
+    return any(model_id not in _PINHOLE_MODEL_IDS for model_id, *_ in cameras.values())
+
+
+def run_undistortion(source: Path, sparse_dir: Path, output: Path, max_image_size: int) -> Path:
+    """Run colmap image_undistorter; return the undistorted dataset root."""
+    import subprocess
+
+    images_path = None
+    for candidate in [source / "images", sparse_dir.parent.parent / "images",
+                      sparse_dir.parent / "images"]:
+        if candidate.is_dir():
+            images_path = candidate
+            break
+    if images_path is None:
+        sys.exit(
+            "Cannot find images/ directory relative to source. "
+            "Pass the COLMAP dataset root as --source."
+        )
+
+    undist_dir = output / "_undistorted"
+    undist_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "colmap", "image_undistorter",
+        "--image_path", str(images_path),
+        "--input_path", str(sparse_dir),
+        "--output_path", str(undist_dir),
+        "--output_type", "COLMAP",
+        "--max_image_size", str(max_image_size),
+    ]
+    print(f"Running undistortion (this may take a minute) ...")
+    print(f"  {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError:
+        sys.exit("'colmap' not found on PATH. Install COLMAP or run undistortion manually.")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"colmap image_undistorter failed with exit code {e.returncode}")
+
+    return undist_dir
+
+
 def build_snapshots(source: Path, output: Path, n_init: int, step: int,
-                    order: str, max_snapshots: int):
+                    order: str, max_snapshots: int,
+                    undistort: bool = False, max_image_size: int = 1920):
     # Pre-flight: verify we can actually write to the output location before
     # spending time reading the COLMAP model.
     try:
@@ -259,6 +307,31 @@ def build_snapshots(source: Path, output: Path, n_init: int, step: int,
     all_images = read_images(str(img_bin))
     all_points = read_points3d(str(pt3_bin))
     print(f"  {len(all_cameras)} cameras, {len(all_images)} images, {len(all_points)} 3D points")
+
+    # MEGS-2 only handles PINHOLE/SIMPLE_PINHOLE.  GLOMAP typically outputs
+    # SIMPLE_RADIAL, which must be undistorted first.
+    if needs_undistortion(all_cameras):
+        model_names = {v[0] for v in all_cameras.values()}
+        if not undistort:
+            sys.exit(
+                f"Camera model(s) {model_names} are not PINHOLE/SIMPLE_PINHOLE.\n"
+                f"MEGS-2 requires undistorted cameras. Re-run with --undistort:\n\n"
+                f"  python tools/simulate_progressive.py --undistort "
+                f"--source {source} --output {output} ..."
+            )
+        undist_root = run_undistortion(source, sparse_dir, output, max_image_size)
+        # Reload from the undistorted model (colmap writes to sparse/, not sparse/0/)
+        sparse_dir = find_sparse_dir(undist_root)
+        cam_bin = sparse_dir / "cameras.bin"
+        img_bin = sparse_dir / "images.bin"
+        pt3_bin = sparse_dir / "points3D.bin"
+        print(f"Reloading undistorted model from {sparse_dir} ...")
+        all_cameras = read_cameras(str(cam_bin))
+        all_images = read_images(str(img_bin))
+        all_points = read_points3d(str(pt3_bin))
+        print(f"  {len(all_cameras)} cameras, {len(all_images)} images, {len(all_points)} 3D points")
+        # Images are now in the undistorted directory
+        source = undist_root
 
     # --- Order images ---
     if order == "filename":
@@ -361,11 +434,17 @@ def main():
                         help="Image ordering: 'filename' (natural sort) or 'image_id' (default: filename)")
     parser.add_argument("--max-snapshots", type=int, default=0, metavar="N",
                         help="Stop after N snapshots (default: all)")
+    parser.add_argument("--undistort", action="store_true",
+                        help="Run colmap image_undistorter if cameras are not PINHOLE. "
+                             "Requires 'colmap' on PATH.")
+    parser.add_argument("--max-image-size", type=int, default=1920, metavar="PX",
+                        help="Max image dimension passed to colmap image_undistorter (default: 1920)")
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
     build_snapshots(args.source, args.output, args.n_init, args.step,
-                    args.order, args.max_snapshots)
+                    args.order, args.max_snapshots,
+                    undistort=args.undistort, max_image_size=args.max_image_size)
 
 
 if __name__ == "__main__":
