@@ -277,11 +277,6 @@ class ProgressiveScene:
         self.last_basic_pcd = current_pcd
         self.current_basic_pcd = current_pcd
 
-        # Set cameras_extent on the very first ingestion
-        if self._n_images == 0:
-            norm = getNerfppNorm(cam_infos)
-            self.cameras_extent = norm["radius"]
-
         new_cam_objects = cameraList_from_camInfos(cam_infos, 1.0, self.model_args)
 
         new_cams = []
@@ -316,6 +311,15 @@ class ProgressiveScene:
                 new_cam_indices.append(idx)
 
         self._n_images = len(self.train_cameras)
+
+        # Recompute extent over the full current camera set. New ingests can
+        # dramatically expand scene scale (operator walks 50m away), and stale
+        # extent makes densify/prune thresholds and new-point spatial_lr_scale
+        # wrong. Existing Gaussians keep the spatial_lr_scale they were born
+        # with — fixing that requires a separate LR-warmup-after-reset pass.
+        if self.train_cameras:
+            self.cameras_extent = getNerfppNorm(self.train_cameras)["radius"]
+
         return new_cams, new_point_mask, new_cam_indices
 
     def get_sfm_points_visible_to(
