@@ -497,7 +497,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
     iters_since_cull = 0
 
     n_at_last_prune = 0
-    has_culled = False
+    cycle_at_last_cull = -1  # allow first cull on cycle 0
     mask_blur = None
     viewpoint_stack = None
     global_iter = 0
@@ -706,6 +706,8 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                         )
                         n_after = gaussians._xyz.shape[0]
                         monitor.update_densify(max(n_after - n_before, 0), n_after)
+                        fraction_changed = abs(n_after - n_before) / max(n_after, 1)
+                        monitor.reset(fraction_changed=fraction_changed)
                         mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
                         iters_since_densify = 0
 
@@ -718,10 +720,14 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     min_iters_between=fp_cfg.min_iters_between,
                     require_states=tuple(fp_cfg.require_state),
                 ):
+                    n_before_fp = gaussians._xyz.shape[0]
                     gaussians.opacity_size_prune(
                         min_opacity=0.005, max_screen_size=None,
                         extent=prog_scene.cameras_extent,
                     )
+                    n_after_fp = gaussians._xyz.shape[0]
+                    fraction_pruned = (n_before_fp - n_after_fp) / max(n_before_fp, 1)
+                    monitor.reset(fraction_changed=fraction_pruned)
                     iters_since_fast_prune = 0
 
                 # ---- Lightweight importance prune ----
@@ -741,7 +747,10 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     iters_since_lw_prune = 0
 
                 # ---- SG axis cull ----
-                if not has_culled:
+                # Fires at most once per convergence cycle. monitor.cycle bumps
+                # on every reset (ingest, densify, prune); axis-cull is a heavy
+                # appearance-basis change so we want a fresh look after it.
+                if monitor.cycle > cycle_at_last_cull:
                     cull_cfg = cfg.triggers.cull_sg_axes
                     if should_cull_sg_axes(
                         gaussians, monitor, tc.sharpness_threshold,
@@ -752,7 +761,9 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     ):
                         gaussians.cull_low_sharpness_axes(
                             sharpness_threshold=tc.sharpness_threshold)
-                        has_culled = True
+                        cycle_at_last_cull = monitor.cycle
+                        monitor.reset(fraction_changed=0.3)
+                        iters_since_cull = 0
                         torch.cuda.empty_cache()
 
             gaussians.optimizer.step()
