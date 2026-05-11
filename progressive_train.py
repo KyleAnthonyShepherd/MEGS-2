@@ -379,8 +379,8 @@ def dense_init_for_new_images(
 
             if outcome is None:
                 logger.warning(
-                    f"[dense-init] sanity filter rejected too much for "
-                    f"{cam.image_name}, skipping"
+                    f"[dense-init] {cam.image_name}: no valid depth pixels after "
+                    f"sanity filter — skipping"
                 )
                 continue
 

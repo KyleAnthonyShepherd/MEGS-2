@@ -346,7 +346,11 @@ def depth_to_points(
 
     rejected_fraction = (rejected & valid_depth).sum() / max(valid_depth.sum(), 1)
     if rejected_fraction > max_rejected_fraction:
-        return None
+        import logging as _log
+        _log.getLogger("dense-init").info(
+            f"sanity filter rejected {rejected_fraction:.0%} of pixels "
+            f"(threshold {max_rejected_fraction:.0%}); using surviving {(1-rejected_fraction):.0%}"
+        )
 
     surviving = valid_depth & ~rejected
     n_survive = surviving.sum()
