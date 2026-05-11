@@ -316,6 +316,7 @@ def dense_init_for_new_images(
     opt,
     current_iter: int,
     dav2_model=None,
+    max_gaussians: int = 0,
 ):
     """Run DAv2 on each new image, align to SfM, filter, append as Gaussians.
 
@@ -431,9 +432,33 @@ def dense_init_for_new_images(
         logger.info("[dense-init] all dense points covered by existing Gaussians — nothing added")
         return
 
+    novel_xyz = all_xyz[novel_mask]
+    novel_rgb = all_rgb[novel_mask]
+
+    # Cap total Gaussians to max_gaussians if set.
+    # Randomly subsample here rather than pruning afterwards: importance scores
+    # are meaningless for untrained Gaussians, and grace protection would block
+    # any post-init importance prune anyway.
+    if max_gaussians > 0:
+        capacity = max_gaussians - gaussians.get_xyz.shape[0]
+        if capacity <= 0:
+            logger.warning("[dense-init] already at capacity — skipping dense init")
+            return
+        if n_novel > capacity:
+            rng = np.random.default_rng(0)
+            keep = rng.choice(n_novel, size=capacity, replace=False)
+            keep.sort()
+            novel_xyz = novel_xyz[keep]
+            novel_rgb = novel_rgb[keep]
+            logger.info(
+                f"[dense-init] capped {n_novel} → {capacity} dense points "
+                f"to stay within max_gaussians={max_gaussians}"
+            )
+            n_novel = capacity
+
     novel_pcd = BasicPointCloud(
-        points=all_xyz[novel_mask],
-        colors=all_rgb[novel_mask],
+        points=novel_xyz,
+        colors=novel_rgb,
         normals=np.zeros((n_novel, 3), dtype=np.float32),
     )
 
@@ -450,7 +475,7 @@ def dense_init_for_new_images(
     peak_vram = torch.cuda.max_memory_allocated() / 1024 ** 2
     logger.info(
         f"[dense-init] added {n_novel} dense Gaussians "
-        f"(rejected {len(all_xyz) - n_novel} as redundant); "
+        f"(rejected {len(all_xyz) - n_novel} as redundant or over-cap); "
         f"wall={elapsed:.1f}s peak_vram={peak_vram:.0f}MB"
     )
 
@@ -843,14 +868,8 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
             gaussians, prog_scene, new_cams,
             config.dense_init, opt, current_iter=0,
             dav2_model=_persistent_dav2,
+            max_gaussians=config.training.num_max_ceiling,
         )
-        soft_cap = int(config.training.num_max_ceiling * 0.85)
-        if gaussians._xyz.shape[0] > soft_cap:
-            logger.info(
-                f"[dense-init] {gaussians._xyz.shape[0]} Gaussians exceed soft_cap "
-                f"({soft_cap}); pruning before initial phase ..."
-            )
-            lightweight_prune(gaussians, prog_scene, opt, config, global_iter=0)
 
     bg_white = getattr(dataset, 'white_background', False)
     global_iter = 0
@@ -893,6 +912,7 @@ def progressive_training(dataset, opt, pipe, args, config: ProgressiveConfig):
                 gaussians, prog_scene, new_cams,
                 config.dense_init, opt, current_iter=global_iter,
                 dav2_model=_persistent_dav2,
+                max_gaussians=config.training.num_max_ceiling,
             )
 
         # Phase 6: parse match matrix and compute image weights
