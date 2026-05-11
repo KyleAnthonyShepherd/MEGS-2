@@ -717,7 +717,7 @@ def train_window(
                     densify_settle_views = training_cfg.densify_min_obs
 
             # T7: lightweight importance prune — fire when monitor says stalled/converged
-            if phase != "initial" and monitor.state() in ("stalled", "converged"):
+            if monitor.state() in ("stalled", "converged"):
                 if should_lightweight_prune(gaussians, monitor,
                                             n_at_last_prune, soft_cap,
                                             growth_threshold=training_cfg.lightweight_prune_growth_threshold):
