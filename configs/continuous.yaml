@@ -1,0 +1,75 @@
+# Continuous MEGS² training configuration — unbounded streaming mode.
+# All timing signals are convergence states, not iteration counts.
+
+convergence:
+  loss_window: 200
+  densify_window: 10
+  converged_slope: -1.0e-4
+  active_densify: 0.05
+  active_slope: -1.0e-3
+
+triggers:
+  densify:
+    min_iters_between: 60
+    require_state: ["wants_capacity"]
+  fast_prune:
+    min_iters_between: 200
+    require_state: ["stalled", "converged"]
+  lightweight_prune:
+    min_iters_between: 100
+    require_state: ["stalled"]
+  cull_sg_axes:
+    min_iters_between: 500
+    require_state: ["converged"]
+
+skipgs:
+  enabled: true
+  warmup_steady_samples: 50
+  beta: 0.95
+  eps: 1.0e-8
+  rho_lo: 0.5
+
+bootstrap:
+  # Optimizer steps begin only after this many images have been ingested.
+  # accumulation_views: 4 requires at least 4 images without padding hacks.
+  min_images: 4
+
+training:
+  accumulation_views: 4
+  num_max_ceiling: 800000
+  prune_ratio1: 0.05
+  prune_ratio2: 0.05
+  sharpness_threshold: 1.0
+  imp_metric: outdoor
+  imp_score_camera_subsample: 0
+  densify_min_obs: 10
+  densify_candidate_fraction: 0.005
+  fast_prune_dead_fraction: 0.02
+  lightweight_prune_growth_threshold: 0.10
+  sg_axis_cull_low_fraction: 0.20
+  fast_final_prune_ratio: 0.10
+
+dense_init:
+  enabled: true
+  min_sfm_points_for_alignment: 10
+  min_sfm_depth_range_fraction: 0.10
+  target_dense_points_per_image: 30000
+  novelty_distance_threshold: 0.01
+  depth_disagreement_threshold: 0.10
+  max_rejected_fraction: 0.5
+  grace_iters: 20
+  persist_model: false
+  dav2:
+    model_size: large
+    input_resolution: 518
+    device: cuda
+    fp16: false
+  ransac:
+    iterations: 200
+    inlier_threshold: 0.05
+    min_inliers: 8
+
+http:
+  host: "127.0.0.1"
+  port: 8765
+  checkpoint_timeout: 30

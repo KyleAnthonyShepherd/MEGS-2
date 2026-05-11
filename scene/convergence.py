@@ -5,6 +5,9 @@ class ConvergenceMonitor:
     def __init__(self, loss_window=200, densify_window=10):
         self.loss_history = deque(maxlen=loss_window)
         self.densify_history = deque(maxlen=densify_window)
+        # Bumped on every reset(); used by callers that want to fire "once
+        # per convergence cycle" (e.g. SG axis cull).
+        self.cycle = 0
 
     def update_loss(self, ema_loss: float):
         self.loss_history.append(ema_loss)
@@ -22,6 +25,7 @@ class ConvergenceMonitor:
         """
         self.loss_history.clear()
         self._min_entries = max(10, int(self.loss_history.maxlen * fraction_changed))
+        self.cycle += 1
 
     def relative_slope(self) -> float:
         min_entries = getattr(self, '_min_entries', self.loss_history.maxlen)
