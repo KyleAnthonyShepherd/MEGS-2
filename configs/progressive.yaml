@@ -22,7 +22,7 @@ training:
   imp_score_camera_subsample: 0
 
   # T6: multi-view gradient accumulation (1 = original single-view behaviour)
-  accumulation_views: 2
+  accumulation_views: 4
 
   # T7: trigger predicate knobs (expose for calibration)
   densify_min_obs: 10
