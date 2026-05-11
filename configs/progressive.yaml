@@ -49,11 +49,11 @@ dense_init:
 
   min_sfm_points_for_alignment: 10    # below this, skip dense init for this image
   min_sfm_depth_range_fraction: 0.10  # SfM depths must span >=10% of scene scale
-  target_dense_points_per_image: 100000   # was 50000 (T3: denser init)
+  target_dense_points_per_image: 30000   # was 50000 (T3: denser init)
   novelty_distance_threshold: 0.01    # in units of cameras_extent
   depth_disagreement_threshold: 0.10  # fraction of scene scale
   max_rejected_fraction: 0.5
-  grace_iters: 200                    # protect dense Gaussians from pruning this long
+  grace_iters: 20                    # protect dense Gaussians from pruning this long
 
   # T4: hold DAv2 across snapshots (saves ~30 s/snapshot load; costs ~1.3 GB VRAM)
   persist_model: false                # default off; set true to opt in
