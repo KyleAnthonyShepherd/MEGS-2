@@ -271,7 +271,8 @@ def select_cameras_weighted(all_cameras, image_weights, n_top=10, n_random=10):
 # ---------------------------------------------------------------------------
 
 def expand_gaussians_from_new_points(gaussians, prog_scene, new_point_mask, opt,
-                                     distance_threshold=1.0, distance_buffer=1.5):
+                                     distance_threshold=1.0, distance_buffer=1.5,
+                                     birth_iter=0):
     pcd = prog_scene.current_basic_pcd
     if pcd is None or new_point_mask.sum() == 0:
         return
@@ -293,7 +294,7 @@ def expand_gaussians_from_new_points(gaussians, prog_scene, new_point_mask, opt,
     if n_novel == 0:
         return
     logger.info(f"[expand] Adding {n_novel} Gaussians from new SfM points")
-    gaussians.expand_from_pcd(pcd, novel_global, prog_scene.cameras_extent)
+    gaussians.expand_from_pcd(pcd, novel_global, prog_scene.cameras_extent, birth_iter=birth_iter)
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +404,7 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
 
     n_before = gaussians.get_xyz.shape[0]
     gaussians.expand_from_pcd(novel_pcd, np.ones(n_novel, dtype=bool),
-                               prog_scene.cameras_extent)
+                               prog_scene.cameras_extent, birth_iter=current_iter)
     n_after = gaussians.get_xyz.shape[0]
     gaussians.mark_recently_added(
         slice(n_before, n_after), iteration=current_iter,
@@ -530,15 +531,22 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
             # First snapshot: initialise Gaussians from sparse cloud
             if n_before_ingest == 0:
                 gaussians.create_from_pcd(
-                    prog_scene.current_basic_pcd, prog_scene.cameras_extent)
+                    prog_scene.current_basic_pcd, prog_scene.cameras_extent,
+                    birth_iter=global_iter)
                 gaussians.training_setup(opt)
                 mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
                 n_at_last_prune = gaussians._xyz.shape[0]
 
+            # Retrofit existing cohort LR schedules to the current scene scale,
+            # then seed new Gaussians from sparse / dense points at this scale.
+            if n_before_ingest > 0:
+                gaussians.rescale_lr_scale_to(prog_scene.cameras_extent, opt)
+
             # Subsequent snapshots: seed from new sparse points
             if n_before_ingest > 0 and new_point_mask.sum() > 0:
                 expand_gaussians_from_new_points(
-                    gaussians, prog_scene, new_point_mask, opt)
+                    gaussians, prog_scene, new_point_mask, opt,
+                    birth_iter=global_iter)
 
             # Dense init for each newly ingested image
             if cfg.dense_init.enabled and new_cams:
