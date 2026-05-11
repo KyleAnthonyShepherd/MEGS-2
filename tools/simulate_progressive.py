@@ -306,10 +306,16 @@ def build_snapshots(source: Path, output: Path, n_init: int, step: int,
         write_images(str(out_sparse / "images.bin"), images_in_snap, valid_p3d_ids)
         write_points3d(str(out_sparse / "points3D.bin"), points_in_snap, img_id_set)
 
-        # Symlink images/ if source has one
+        # Symlink images/ if source has one.
+        # Use a relative path so the output tree is portable.
         link = snap_dir / "images"
         if images_src and not link.exists():
-            link.symlink_to(images_src)
+            try:
+                rel = os.path.relpath(images_src, snap_dir)
+                link.symlink_to(rel)
+            except PermissionError:
+                print(f"  [warn] cannot create images symlink in {snap_dir} "
+                      f"(permission denied) — copy images manually if needed")
 
         print(f"  snap {snap_num:3d}: {len(images_in_snap):4d} images, "
               f"{len(points_in_snap):6d} 3D points → {snap_dir}")
