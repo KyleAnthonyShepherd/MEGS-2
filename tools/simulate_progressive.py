@@ -231,6 +231,19 @@ def find_sparse_dir(source: Path) -> Path:
 
 def build_snapshots(source: Path, output: Path, n_init: int, step: int,
                     order: str, max_snapshots: int):
+    # Pre-flight: verify we can actually write to the output location before
+    # spending time reading the COLMAP model.
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        probe = output / ".write_probe"
+        probe.touch()
+        probe.unlink()
+    except PermissionError:
+        sys.exit(
+            f"Error: cannot write to {output}\n"
+            f"Try a path you own, e.g. --output /tmp/progressive_sim or ~/progressive_sim"
+        )
+
     sparse_dir = find_sparse_dir(source)
 
     # --- Load full model ---
@@ -313,9 +326,8 @@ def build_snapshots(source: Path, output: Path, n_init: int, step: int,
             try:
                 rel = os.path.relpath(images_src, snap_dir)
                 link.symlink_to(rel)
-            except PermissionError:
-                print(f"  [warn] cannot create images symlink in {snap_dir} "
-                      f"(permission denied) — copy images manually if needed")
+            except OSError as e:
+                print(f"  [warn] cannot create images symlink in {snap_dir}: {e}")
 
         print(f"  snap {snap_num:3d}: {len(images_in_snap):4d} images, "
               f"{len(points_in_snap):6d} 3D points → {snap_dir}")
