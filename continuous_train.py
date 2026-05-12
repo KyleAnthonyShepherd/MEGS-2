@@ -428,10 +428,17 @@ def run_lightweight_prune(gaussians, prog_scene, opt, cfg, global_iter):
         weights=prog_scene.image_weights,
     )
     grace_mask = gaussians.get_grace_protected_mask(global_iter)
+    # Index-based bottom-K selection: with value-thresholding (<=), heavy
+    # ties at the bottom of the importance distribution (e.g. unobserved
+    # dense-init Gaussians sitting at zero) cause the mask to scoop up far
+    # more than prune_ratio1 of the population. argsort selects exactly N
+    # rows regardless of ties.
     threshold = int(cfg.training.prune_ratio1 * imp_score.shape[0])
-    imp_sorted, _ = torch.sort(imp_score, 0)
-    imp_thresh = imp_sorted[max(threshold - 1, 0)]
-    prune_mask = (imp_score <= imp_thresh).squeeze() & ~grace_mask
+    flat_imp = imp_score.squeeze()
+    sorted_indices = torch.argsort(flat_imp)
+    prune_mask = torch.zeros_like(flat_imp, dtype=torch.bool)
+    prune_mask[sorted_indices[:threshold]] = True
+    prune_mask = prune_mask & ~grace_mask
     before = gaussians._xyz.shape[0]
     gaussians.prune_points(prune_mask)
     after = gaussians._xyz.shape[0]

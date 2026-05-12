@@ -8,6 +8,10 @@ class ConvergenceMonitor:
         # Bumped on every reset(); used by callers that want to fire "once
         # per convergence cycle" (e.g. SG axis cull).
         self.cycle = 0
+        # Counts consecutive samples classified as "stalled". When this
+        # reaches loss_window, the slope has been in the noise floor for an
+        # entire window — practically converged. Promoted in state().
+        self._stalled_count = 0
 
     def update_loss(self, ema_loss: float):
         self.loss_history.append(ema_loss)
@@ -26,6 +30,7 @@ class ConvergenceMonitor:
         self.loss_history.clear()
         self._min_entries = max(10, int(self.loss_history.maxlen * fraction_changed))
         self.cycle += 1
+        self._stalled_count = 0
 
     def relative_slope(self) -> float:
         min_entries = getattr(self, '_min_entries', self.loss_history.maxlen)
@@ -49,9 +54,18 @@ class ConvergenceMonitor:
         s = self.relative_slope()
         d = self.densify_saturation()
         if s > converged_slope and d < 0.01:
+            self._stalled_count = 0
             return "converged"
         if d > active_densify and s < active_slope:
+            self._stalled_count = 0
             return "wants_capacity"
         if s < active_slope:
+            self._stalled_count = 0
             return "improving"
+        # Stalled. If we've been here for an entire loss window the slope is
+        # in the noise floor — promote to converged so the trainer can idle
+        # instead of grinding indefinitely just outside the converged band.
+        self._stalled_count += 1
+        if self._stalled_count >= self.loss_history.maxlen:
+            return "converged"
         return "stalled"
