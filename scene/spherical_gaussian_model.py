@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -33,6 +35,12 @@ class SphericalGaussianModel:
         self.max_sg_degree = max_sg_degree
         self.variable_sg_bands = variable_sg_bands
 
+        # When set (by stable_views() context manager), the 8 cohort-cat
+        # properties return cached tensors instead of re-concatenating every
+        # access. Trainer enters the context around the K-view render loop
+        # where the model is read-only; exit before any mutation.
+        self._iter_views: dict = None
+
         # Per-cohort parameter lists — one entry per creation event.
         self._xyz_cohorts: list = []
         self._rgb_base_cohorts: list = []
@@ -64,69 +72,68 @@ class SphericalGaussianModel:
     # All existing read sites (renderer, densify, triggers) use these.
     # ------------------------------------------------------------------
 
+    def _cat_cohort(self, name, cohorts, empty_shape):
+        if self._iter_views is not None and name in self._iter_views:
+            return self._iter_views[name]
+        if not cohorts:
+            t = torch.empty(*empty_shape, device="cuda")
+        elif len(cohorts) == 1:
+            t = cohorts[0]
+        else:
+            t = torch.cat(cohorts, dim=0)
+        if self._iter_views is not None:
+            self._iter_views[name] = t
+        return t
+
     @property
     def _xyz(self):
-        if not self._xyz_cohorts:
-            return torch.empty(0, 3, device="cuda")
-        if len(self._xyz_cohorts) == 1:
-            return self._xyz_cohorts[0]
-        return torch.cat(self._xyz_cohorts, dim=0)
+        return self._cat_cohort("_xyz", self._xyz_cohorts, (0, 3))
 
     @property
     def _rgb_base(self):
-        if not self._rgb_base_cohorts:
-            return torch.empty(0, 3, device="cuda")
-        if len(self._rgb_base_cohorts) == 1:
-            return self._rgb_base_cohorts[0]
-        return torch.cat(self._rgb_base_cohorts, dim=0)
+        return self._cat_cohort("_rgb_base", self._rgb_base_cohorts, (0, 3))
 
     @property
     def _opacity(self):
-        if not self._opacity_cohorts:
-            return torch.empty(0, 1, device="cuda")
-        if len(self._opacity_cohorts) == 1:
-            return self._opacity_cohorts[0]
-        return torch.cat(self._opacity_cohorts, dim=0)
+        return self._cat_cohort("_opacity", self._opacity_cohorts, (0, 1))
 
     @property
     def _scaling(self):
-        if not self._scaling_cohorts:
-            return torch.empty(0, 3, device="cuda")
-        if len(self._scaling_cohorts) == 1:
-            return self._scaling_cohorts[0]
-        return torch.cat(self._scaling_cohorts, dim=0)
+        return self._cat_cohort("_scaling", self._scaling_cohorts, (0, 3))
 
     @property
     def _rotation(self):
-        if not self._rotation_cohorts:
-            return torch.empty(0, 4, device="cuda")
-        if len(self._rotation_cohorts) == 1:
-            return self._rotation_cohorts[0]
-        return torch.cat(self._rotation_cohorts, dim=0)
+        return self._cat_cohort("_rotation", self._rotation_cohorts, (0, 4))
 
     @property
     def _sg_directions(self):
-        if not self._sg_directions_cohorts:
-            return torch.empty(0, self.max_sg_degree, 3, device="cuda")
-        if len(self._sg_directions_cohorts) == 1:
-            return self._sg_directions_cohorts[0]
-        return torch.cat(self._sg_directions_cohorts, dim=0)
+        return self._cat_cohort(
+            "_sg_directions", self._sg_directions_cohorts, (0, self.max_sg_degree, 3))
 
     @property
     def _sg_sharpness(self):
-        if not self._sg_sharpness_cohorts:
-            return torch.empty(0, self.max_sg_degree, 1, device="cuda")
-        if len(self._sg_sharpness_cohorts) == 1:
-            return self._sg_sharpness_cohorts[0]
-        return torch.cat(self._sg_sharpness_cohorts, dim=0)
+        return self._cat_cohort(
+            "_sg_sharpness", self._sg_sharpness_cohorts, (0, self.max_sg_degree, 1))
 
     @property
     def _sg_rgb(self):
-        if not self._sg_rgb_cohorts:
-            return torch.empty(0, self.max_sg_degree, 3, device="cuda")
-        if len(self._sg_rgb_cohorts) == 1:
-            return self._sg_rgb_cohorts[0]
-        return torch.cat(self._sg_rgb_cohorts, dim=0)
+        return self._cat_cohort(
+            "_sg_rgb", self._sg_rgb_cohorts, (0, self.max_sg_degree, 3))
+
+    @contextmanager
+    def stable_views(self):
+        """Cache the cohort-concatenated tensors for the lifetime of the block.
+
+        Inside this context, repeated reads of _xyz / get_xyz / etc. return
+        the same cached tensor instead of re-concatenating per call. The
+        caller must NOT mutate any cohort tensors inside the block —
+        renders, triggers that only read, and importance scoring are fine.
+        """
+        self._iter_views = {}
+        try:
+            yield
+        finally:
+            self._iter_views = None
 
     # ------------------------------------------------------------------
     # Standard model properties (unchanged API for callers)
