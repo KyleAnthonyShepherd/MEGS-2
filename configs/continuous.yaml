@@ -121,13 +121,13 @@ training:
   # Fraction of Gaussians to prune in lightweight_prune. Now uses argsort
   # so this is exactly the fraction pruned (modulo grace-protected rows),
   # not a value threshold that overshoots on ties.
-  prune_ratio1: 0.05
+  prune_ratio1: 0.125
 
   # Currently unused (legacy).
   prune_ratio2: 0.05
 
   # Below this sharpness, an SG axis is considered "dull" for cull_sg_axes.
-  sharpness_threshold: 1.0
+  sharpness_threshold: 2.0
 
   # outdoor | indoor — affects how importance score is computed (which
   # camera-coverage and rendering signals weigh more).
