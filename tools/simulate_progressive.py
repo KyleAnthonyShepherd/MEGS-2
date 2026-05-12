@@ -53,6 +53,7 @@ import os
 import struct
 import sys
 import re
+from typing import Optional
 from pathlib import Path
 
 import numpy as np
@@ -419,9 +420,64 @@ def build_snapshots(source: Path, output: Path, n_init: int, step: int,
 # CLI
 # ---------------------------------------------------------------------------
 
-def post_snapshots(snapshot_root: Path, server_url: str, delay: float):
-    """POST each numbered snapshot directory to a running continuous_train server."""
+def _post_one(snap_dir: Path, server_url: str) -> Optional[str]:
     import urllib.request
+    url = server_url.rstrip("/") + "/ingest"
+    body = json.dumps({"snapshot_dir": str(snap_dir.resolve())}).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+        request_id = result.get('request_id')
+        print(f"  POSTed {snap_dir.name} → request_id={request_id}")
+        return request_id
+    except Exception as e:
+        print(f"  ERROR posting {snap_dir.name}: {e}", file=sys.stderr)
+        return None
+
+
+def _wait_for_integration(server_url: str, request_id: str, timeout: float = 600.0):
+    """Poll /status/{request_id} until state is 'training' or 'converged'."""
+    import urllib.request
+    import time as _time
+    url = server_url.rstrip("/") + f"/status/{request_id}"
+    deadline = _time.time() + timeout
+    last_state = None
+    while _time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                state = json.loads(resp.read()).get("state", "unknown")
+        except Exception as e:
+            print(f"  status poll error: {e}", file=sys.stderr)
+            _time.sleep(1.0)
+            continue
+        if state != last_state:
+            print(f"  state={state}")
+            last_state = state
+        if state in ("training", "converged"):
+            return state
+        if state == "unknown":
+            return state
+        _time.sleep(0.5)
+    print(f"  WARNING: timed out waiting for {request_id}", file=sys.stderr)
+    return last_state
+
+
+def post_one_snapshot(snap_dir: Path, server_url: str, wait: bool):
+    """POST exactly one snapshot and optionally wait for it to be integrated."""
+    if not snap_dir.is_dir():
+        sys.exit(f"Not a directory: {snap_dir}")
+    rid = _post_one(snap_dir, server_url)
+    if wait and rid:
+        _wait_for_integration(server_url, rid)
+
+
+def post_snapshots(snapshot_root: Path, server_url: str, delay: float, wait: bool):
+    """POST each numbered snapshot directory to a running continuous_train server."""
     import time as _time
 
     snap_dirs = sorted(
@@ -432,20 +488,10 @@ def post_snapshots(snapshot_root: Path, server_url: str, delay: float):
     if not snap_dirs:
         sys.exit(f"No numbered snapshot directories found in {snapshot_root}")
 
-    url = server_url.rstrip("/") + "/ingest"
     for snap_dir in snap_dirs:
-        body = json.dumps({"snapshot_dir": str(snap_dir.resolve())}).encode()
-        req = urllib.request.Request(
-            url, data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                result = json.loads(resp.read())
-            print(f"  POSTed {snap_dir.name} → request_id={result.get('request_id')}")
-        except Exception as e:
-            print(f"  ERROR posting {snap_dir.name}: {e}", file=sys.stderr)
+        rid = _post_one(snap_dir, server_url)
+        if wait and rid:
+            _wait_for_integration(server_url, rid)
         if delay > 0:
             _time.sleep(delay)
 
@@ -477,14 +523,23 @@ def main():
     # Post mode
     parser.add_argument("--post-snapshots", type=Path, default=None, metavar="DIR",
                         help="Directory of numbered snapshots to POST to a running server")
+    parser.add_argument("--post-one", type=Path, default=None, metavar="SNAP_DIR",
+                        help="POST a single snapshot directory to a running server and exit")
     parser.add_argument("--server", type=str, default="http://127.0.0.1:8765",
                         help="continuous_train server URL (default: http://127.0.0.1:8765)")
     parser.add_argument("--delay", type=float, default=0.0,
                         help="Seconds to wait between POST requests (default: 0)")
+    parser.add_argument("--wait", action="store_true",
+                        help="Poll /status/{request_id} after each POST until the "
+                             "trainer reports state=training or converged.")
     args = parser.parse_args()
 
+    if args.post_one is not None:
+        post_one_snapshot(args.post_one, args.server, args.wait)
+        return
+
     if args.post_snapshots is not None:
-        post_snapshots(args.post_snapshots, args.server, args.delay)
+        post_snapshots(args.post_snapshots, args.server, args.delay, args.wait)
         return
 
     if args.source is None or args.output is None:
