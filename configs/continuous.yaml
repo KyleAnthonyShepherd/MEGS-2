@@ -144,7 +144,7 @@ training:
   # densify fires only if ≥ this fraction of Gaussians are candidates
   # (have high gradient or are in the blur mask). Suppresses futile fires
   # when gradient signal is weak across the board.
-  densify_candidate_fraction: 0.005
+  densify_candidate_fraction: 0.001
 
   # fast_prune fires only if ≥ this fraction of Gaussians have opacity
   # below the dead-threshold. Suppresses no-op prunes.
