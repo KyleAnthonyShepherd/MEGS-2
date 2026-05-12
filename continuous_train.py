@@ -611,7 +611,54 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
             ctrl.wait_for_work(timeout=0.5)
             continue
 
-        # ---- 4. Optimizer step ----
+        # ---- 4. Converged-idle gate (BEFORE iter work) ----
+        # Compute state from the existing loss_history without doing any new
+        # optimizer work. If we're converged, run pending cull/snapshot/idle
+        # logic and skip the iteration entirely — otherwise the trainer would
+        # burn GPU on optimizer steps that don't change anything meaningful.
+        cur_state = monitor.state(
+            conv_cfg.converged_slope, conv_cfg.active_densify, conv_cfg.active_slope)
+        if (cur_state == "converged"
+                and ctrl.queue_depth == 0
+                and not ctrl.checkpoint_pending()):
+            if monitor.cycle > cycle_at_last_cull:
+                cull_cfg = cfg.triggers.cull_sg_axes
+                if should_cull_sg_axes(
+                    cur_state, gaussians, tc.sharpness_threshold,
+                    fraction_low=tc.sg_axis_cull_low_fraction,
+                    iters_since_last=iters_since_cull,
+                    min_iters_between=cull_cfg.min_iters_between,
+                    require_states=tuple(cull_cfg.require_state),
+                ):
+                    n_unchanged = gaussians._xyz.shape[0]
+                    gaussians.cull_low_sharpness_axes(
+                        sharpness_threshold=tc.sharpness_threshold)
+                    monitor.reset(fraction_changed=0.3)
+                    # Capture cycle AFTER reset; reset bumps it, so this
+                    # disables re-firing until an external event (ingest,
+                    # densify, prune) bumps the cycle again.
+                    cycle_at_last_cull = monitor.cycle
+                    iters_since_cull = 0
+                    torch.cuda.empty_cache()
+                    logger.info(
+                        f"[cull] SG axes pruned; Gaussian count unchanged at {n_unchanged}"
+                    )
+                    continue
+
+            if wrote_current_at_cycle != monitor.cycle:
+                path = write_snapshot_atomic(model_path, gaussians)
+                wrote_current_at_cycle = monitor.cycle
+                logger.info(f"[converged] Wrote {path}; idling until next ingest or checkpoint")
+            ctrl.update_status(
+                gaussian_count=gaussians._xyz.shape[0],
+                monitor_state="converged",
+                n_images=prog_scene.n_images,
+                bootstrap_complete=bootstrapped,
+            )
+            ctrl.wait_for_work(timeout=5.0)
+            continue
+
+        # ---- 5. Optimizer step ----
         K = max(1, tc.accumulation_views)
         gaussians.update_learning_rate(global_iter)
 
@@ -647,9 +694,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
             base_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
             per_view_packs.append((cam_w * base_loss, render_pkg, vcam.uid, vcam.image_name, cam_w))
 
-        # SkipGS gating
-        cur_state = monitor.state(
-            conv_cfg.converged_slope, conv_cfg.active_densify, conv_cfg.active_slope)
+        # SkipGS gating — uses cur_state snapshotted at top of loop
         if skipgs is not None:
             skipgs.notify_monitor_state(cur_state)
             for loss_t, _, cam_id, _, _ in per_view_packs:
@@ -761,25 +806,10 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     monitor.reset(fraction_changed=fraction_pruned)
                     iters_since_lw_prune = 0
 
-                # ---- SG axis cull ----
-                # Fires at most once per convergence cycle. monitor.cycle bumps
-                # on every reset (ingest, densify, prune); axis-cull is a heavy
-                # appearance-basis change so we want a fresh look after it.
-                if monitor.cycle > cycle_at_last_cull:
-                    cull_cfg = cfg.triggers.cull_sg_axes
-                    if should_cull_sg_axes(
-                        cur_state, gaussians, tc.sharpness_threshold,
-                        fraction_low=tc.sg_axis_cull_low_fraction,
-                        iters_since_last=iters_since_cull,
-                        min_iters_between=cull_cfg.min_iters_between,
-                        require_states=tuple(cull_cfg.require_state),
-                    ):
-                        gaussians.cull_low_sharpness_axes(
-                            sharpness_threshold=tc.sharpness_threshold)
-                        cycle_at_last_cull = monitor.cycle
-                        monitor.reset(fraction_changed=0.3)
-                        iters_since_cull = 0
-                        torch.cuda.empty_cache()
+                # SG axis cull is only handled in the converged-idle gate at
+                # the top of the loop — its require_state is ["converged"],
+                # and we never enter the iter body when converged, so an
+                # in-loop check here would be dead code.
 
             gaussians.optimizer.step()
             gaussians.optimizer.zero_grad(set_to_none=True)
@@ -794,46 +824,6 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     f"[iter {global_iter}] loss={ema_loss:.6f} "
                     f"N={gaussians._xyz.shape[0]} state={cur_state}"
                 )
-
-        # ---- 5. Converged + idle ----
-        if (cur_state == "converged"
-                and ctrl.queue_depth == 0
-                and not ctrl.checkpoint_pending()):
-            # The main iter loop exits to idle the moment "converged" fires,
-            # so the cull check inside that loop never gets a converged state
-            # to act on. Run it here instead — if it fires, monitor.reset()
-            # bumps the cycle, training resumes, and we re-enter convergence
-            # later with the culled model.
-            if monitor.cycle > cycle_at_last_cull:
-                cull_cfg = cfg.triggers.cull_sg_axes
-                if should_cull_sg_axes(
-                    cur_state, gaussians, tc.sharpness_threshold,
-                    fraction_low=tc.sg_axis_cull_low_fraction,
-                    iters_since_last=iters_since_cull,
-                    min_iters_between=cull_cfg.min_iters_between,
-                    require_states=tuple(cull_cfg.require_state),
-                ):
-                    n_before_cull = gaussians._xyz.shape[0]
-                    gaussians.cull_low_sharpness_axes(
-                        sharpness_threshold=tc.sharpness_threshold)
-                    logger.info(f"[cull] SG axes culled (N stays {n_before_cull})")
-                    cycle_at_last_cull = monitor.cycle
-                    monitor.reset(fraction_changed=0.3)
-                    iters_since_cull = 0
-                    torch.cuda.empty_cache()
-                    continue
-
-            if wrote_current_at_cycle != monitor.cycle:
-                path = write_snapshot_atomic(model_path, gaussians)
-                wrote_current_at_cycle = monitor.cycle
-                logger.info(f"[converged] Wrote {path}; idling until next ingest or checkpoint")
-            ctrl.update_status(
-                gaussian_count=gaussians._xyz.shape[0],
-                monitor_state="converged",
-                n_images=prog_scene.n_images,
-                bootstrap_complete=bootstrapped,
-            )
-            ctrl.wait_for_work(timeout=5.0)
 
     # (unreachable — loop runs until KeyboardInterrupt / SIGTERM)
 
