@@ -27,7 +27,7 @@ convergence:
   # converged. Originally -1e-4 — too tight, runs would park just outside
   # the converged band indefinitely. -5e-4 catches genuinely-flat slopes
   # without prematurely declaring convergence on improving runs.
-  converged_slope: -5.0e-4
+  converged_slope: -2.0e-4
 
   # densify_saturation threshold for wants_capacity. If recent densifies
   # added > 5% of Gaussians AND slope is still steep, we want more capacity.
