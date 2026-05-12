@@ -1,77 +1,222 @@
 # Continuous MEGS² training configuration — unbounded streaming mode.
 # All timing signals are convergence states, not iteration counts.
 
+# ---------------------------------------------------------------------------
+# convergence — defines the four monitor states the trainer reacts to.
+# ---------------------------------------------------------------------------
+# The monitor keeps a rolling deque of EMA loss samples (one per iter) and
+# returns one of: improving / stalled / wants_capacity / converged.
+#
+# Slope is computed as relative_slope = (recent[-1] - recent[0]) / window /
+# recent[-1] — fraction of current loss per sample. More negative = faster
+# improvement. Densify saturation is max(fraction-of-Gaussians-added)
+# over the last `densify_window` densify events.
 convergence:
+  # Number of EMA loss samples in the rolling window. Bigger = smoother
+  # state classification, slower to react. After monitor.reset() the state
+  # machine waits for this many fresh samples (scaled by fraction_changed)
+  # before any non-trivial state can fire again. Stalled-timeout promotion
+  # also triggers after this many consecutive stalled samples.
   loss_window: 200
+
+  # Number of recent densify events whose "fraction added" is averaged for
+  # the densify saturation signal. Gates the wants_capacity state.
   densify_window: 10
-  converged_slope: -1.0e-4
+
+  # Slope must be flatter (less negative) than this to be classified
+  # converged. Originally -1e-4 — too tight, runs would park just outside
+  # the converged band indefinitely. -5e-4 catches genuinely-flat slopes
+  # without prematurely declaring convergence on improving runs.
+  converged_slope: -5.0e-4
+
+  # densify_saturation threshold for wants_capacity. If recent densifies
+  # added > 5% of Gaussians AND slope is still steep, we want more capacity.
   active_densify: 0.05
+
+  # Slope must be steeper than this to count as "actively improving".
+  # The band (active_slope, converged_slope) is the stalled zone.
   active_slope: -1.0e-3
 
+# ---------------------------------------------------------------------------
+# triggers — when each structural change is allowed to fire.
+# ---------------------------------------------------------------------------
+# Each trigger has:
+#   min_iters_between: anti-thrash floor in iters since the trigger last
+#     fired. NOT a trigger; just prevents back-to-back firings.
+#   require_state:     which monitor states permit the action.
+# A trigger ALSO has additional substantive gates in scene/triggers.py
+# (e.g. dead-fraction, growth-fraction, candidate-fraction) that must pass.
 triggers:
+  # Add Gaussians where high gradient or blur mask says detail is needed.
+  # "stalled" is the bootstrap trigger (plateau → need capacity).
+  # "wants_capacity" is the follow-up trigger (just densified, still
+  # improving fast — keep going).
   densify:
     min_iters_between: 60
-    # "stalled" is the bootstrap trigger (plateau → need capacity).
-    # "wants_capacity" is the follow-up trigger (just densified, still improving fast).
     require_state: ["stalled", "wants_capacity"]
+
+  # Cheap opacity/size prune: drops dead splats (opacity below threshold)
+  # and oversized ones. Fires when ≥ fast_prune_dead_fraction of the
+  # population is dead AND the monitor allows it.
   fast_prune:
     min_iters_between: 200
     require_state: ["stalled", "converged"]
+
+  # Importance-based prune: removes the bottom prune_ratio1 of Gaussians by
+  # importance score (computed across all current cameras). Heavier and
+  # more disruptive than fast_prune. Gated on converged so it only fires
+  # once per cycle, not on every transient stall.
   lightweight_prune:
     min_iters_between: 100
-    require_state: ["stalled"]
+    require_state: ["converged"]
+
+  # Spherical-Gaussian axis culling: drops dim/low-sharpness directional
+  # bases. Runs at most once per convergence cycle in the idle path so it
+  # gets a real converged state to act on.
   cull_sg_axes:
     min_iters_between: 500
     require_state: ["converged"]
 
+# ---------------------------------------------------------------------------
+# skipgs — SkipGS-style gradient gate.
+# ---------------------------------------------------------------------------
+# Stops backprop into Gaussians whose recent contribution to the loss is
+# below a threshold. Saves compute on well-converged regions while new
+# regions keep training.
 skipgs:
   enabled: true
+  # Consecutive "improving" samples after enablement before the gate
+  # actually starts skipping. Lets the model settle into the new gradient
+  # statistics first.
   warmup_steady_samples: 50
+  # EMA decay on the per-Gaussian contribution signal.
   beta: 0.95
+  # Numerical floor on the gate denominator.
   eps: 1.0e-8
+  # Gate threshold: Gaussians with normalized contribution below this skip.
   rho_lo: 0.5
 
+# ---------------------------------------------------------------------------
+# bootstrap — minimum images before optimizer steps begin.
+# ---------------------------------------------------------------------------
 bootstrap:
-  # Optimizer steps begin only after this many images have been ingested.
   # accumulation_views: 4 requires at least 4 images without padding hacks.
+  # Until /ingest brings the count to this, the trainer idles in a "waiting
+  # for images" state and bootstrap_complete in /status stays false.
   min_images: 4
 
+# ---------------------------------------------------------------------------
+# training — substantive knobs for each action.
+# ---------------------------------------------------------------------------
 training:
+  # Number of view micro-batches per optimizer step (gradient accumulation).
+  # MUST equal bootstrap.min_images or be ≤ it.
   accumulation_views: 4
+
+  # Hard VRAM-bounded ceiling on total Gaussian count. lightweight_prune
+  # auto-fires above num_max_ceiling * 0.85 regardless of state to keep
+  # the model under cap.
   num_max_ceiling: 800000
+
+  # Fraction of Gaussians to prune in lightweight_prune. Now uses argsort
+  # so this is exactly the fraction pruned (modulo grace-protected rows),
+  # not a value threshold that overshoots on ties.
   prune_ratio1: 0.05
+
+  # Currently unused (legacy).
   prune_ratio2: 0.05
+
+  # Below this sharpness, an SG axis is considered "dull" for cull_sg_axes.
   sharpness_threshold: 1.0
+
+  # outdoor | indoor — affects how importance score is computed (which
+  # camera-coverage and rendering signals weigh more).
   imp_metric: outdoor
+
+  # 0 = compute importance using all cameras. N > 0 = randomly subsample N
+  # cameras per scoring pass. Useful for large scenes; slight noise.
   imp_score_camera_subsample: 0
+
+  # Per-Gaussian minimum observation count before densify considers it
+  # eligible. Ignores Gaussians that haven't been seen enough yet.
   densify_min_obs: 10
+
+  # densify fires only if ≥ this fraction of Gaussians are candidates
+  # (have high gradient or are in the blur mask). Suppresses futile fires
+  # when gradient signal is weak across the board.
   densify_candidate_fraction: 0.005
+
+  # fast_prune fires only if ≥ this fraction of Gaussians have opacity
+  # below the dead-threshold. Suppresses no-op prunes.
   fast_prune_dead_fraction: 0.02
+
+  # lightweight_prune fires when N has grown ≥ this fraction since the
+  # last prune AND state allows. Raise to make prune more reluctant.
   lightweight_prune_growth_threshold: 0.10
+
+  # cull_sg_axes fires only when ≥ this fraction of axes are below
+  # sharpness_threshold. Higher = more reluctant culling.
   sg_axis_cull_low_fraction: 0.20
+
+  # Currently unused (legacy).
   fast_final_prune_ratio: 0.10
 
+# ---------------------------------------------------------------------------
+# dense_init — per-image dense seeding via Depth-Anything-V2 on each ingest.
+# ---------------------------------------------------------------------------
 dense_init:
   enabled: true
+
+  # Skip dense-init if the new image has fewer than this many SfM points
+  # available for monocular-depth-to-SfM alignment.
   min_sfm_points_for_alignment: 10
+
+  # Skip if the SfM depth range is degenerate (too narrow to fit a depth
+  # alignment confidently).
   min_sfm_depth_range_fraction: 0.10
+
+  # Cap on Gaussians seeded from a single new image. Hard ceiling on per-
+  # ingest growth.
   target_dense_points_per_image: 30000
+
+  # Dense points within this distance (relative to scene scale) of an
+  # existing Gaussian are considered redundant and dropped.
   novelty_distance_threshold: 0.01
+
+  # Per-pixel sanity filter: reject dense points whose depth disagrees
+  # with the SfM points projected to the same pixel by more than this
+  # fraction. Bigger = more permissive.
   depth_disagreement_threshold: 0.10
+
+  # If the sanity filter rejects more than this fraction of pixels, skip
+  # the image entirely (depth alignment likely failed).
   max_rejected_fraction: 0.5
+
+  # Number of iters that newly-added Gaussians are protected from any
+  # prune. Raise if newcomers get pruned before they're observed enough.
   grace_iters: 20
+
   persist_model: false
+
+  # Depth-Anything-V2 model config.
   dav2:
     model_size: large
     input_resolution: 518
     device: cuda
     fp16: false
+
+  # RANSAC fitting depth → SfM (affine: a * d + b).
   ransac:
     iterations: 200
     inlier_threshold: 0.05
     min_inliers: 8
 
+# ---------------------------------------------------------------------------
+# http — control server bind.
+# ---------------------------------------------------------------------------
 http:
   host: "127.0.0.1"
   port: 8765
+  # Max seconds a POST /checkpoint will block waiting for the trainer to
+  # actually write the .ply. 0 = no timeout.
   checkpoint_timeout: 30
