@@ -692,34 +692,30 @@ class SphericalGaussianModel:
         self.cohort_lr_scale = new_lr_scales
         self.cohort_xyz_scheduler = new_schedulers
 
-        # Rebuild optimizer param_groups list with surviving cohorts in new index order.
+        # Rebuild optimizer param_groups via add_param_group so PyTorch fills
+        # in every default the Adam step expects (maximize, foreach,
+        # capturable, differentiable, fused, ...). A hand-rolled dict misses
+        # these and step() raises KeyError on whichever it touches first.
         self.optimizer.param_groups = []
+        ta = self._training_args
         for ci in range(len(self._xyz_cohorts)):
-            self.optimizer.param_groups.append(
-                {'params': [self._xyz_cohorts[ci]], 'lr': 0.0, 'name': f'xyz_c{ci}',
-                 'betas': (0.9, 0.999), 'eps': 1e-15, 'weight_decay': 0.0, 'amsgrad': False})
-            self.optimizer.param_groups.append(
-                {'params': [self._rgb_base_cohorts[ci]], 'lr': self._training_args.feature_lr, 'name': f'rgb_base_c{ci}',
-                 'betas': (0.9, 0.999), 'eps': 1e-15, 'weight_decay': 0.0, 'amsgrad': False})
-            self.optimizer.param_groups.append(
-                {'params': [self._opacity_cohorts[ci]], 'lr': self._training_args.opacity_lr, 'name': f'opacity_c{ci}',
-                 'betas': (0.9, 0.999), 'eps': 1e-15, 'weight_decay': 0.0, 'amsgrad': False})
-            self.optimizer.param_groups.append(
-                {'params': [self._scaling_cohorts[ci]], 'lr': self._training_args.scaling_lr, 'name': f'scaling_c{ci}',
-                 'betas': (0.9, 0.999), 'eps': 1e-15, 'weight_decay': 0.0, 'amsgrad': False})
-            self.optimizer.param_groups.append(
-                {'params': [self._rotation_cohorts[ci]], 'lr': self._training_args.rotation_lr, 'name': f'rotation_c{ci}',
-                 'betas': (0.9, 0.999), 'eps': 1e-15, 'weight_decay': 0.0, 'amsgrad': False})
+            self.optimizer.add_param_group(
+                {'params': [self._xyz_cohorts[ci]], 'lr': 0.0, 'name': f'xyz_c{ci}'})
+            self.optimizer.add_param_group(
+                {'params': [self._rgb_base_cohorts[ci]], 'lr': ta.feature_lr, 'name': f'rgb_base_c{ci}'})
+            self.optimizer.add_param_group(
+                {'params': [self._opacity_cohorts[ci]], 'lr': ta.opacity_lr, 'name': f'opacity_c{ci}'})
+            self.optimizer.add_param_group(
+                {'params': [self._scaling_cohorts[ci]], 'lr': ta.scaling_lr, 'name': f'scaling_c{ci}'})
+            self.optimizer.add_param_group(
+                {'params': [self._rotation_cohorts[ci]], 'lr': ta.rotation_lr, 'name': f'rotation_c{ci}'})
             if self.max_sg_degree > 0:
-                self.optimizer.param_groups.append(
-                    {'params': [self._sg_directions_cohorts[ci]], 'lr': self._training_args.feature_lr, 'name': f'sg_directions_c{ci}',
-                     'betas': (0.9, 0.999), 'eps': 1e-15, 'weight_decay': 0.0, 'amsgrad': False})
-                self.optimizer.param_groups.append(
-                    {'params': [self._sg_sharpness_cohorts[ci]], 'lr': self._training_args.feature_lr * 4.0, 'name': f'sg_sharpness_c{ci}',
-                     'betas': (0.9, 0.999), 'eps': 1e-15, 'weight_decay': 0.0, 'amsgrad': False})
-                self.optimizer.param_groups.append(
-                    {'params': [self._sg_rgb_cohorts[ci]], 'lr': self._training_args.feature_lr, 'name': f'sg_rgb_c{ci}',
-                     'betas': (0.9, 0.999), 'eps': 1e-15, 'weight_decay': 0.0, 'amsgrad': False})
+                self.optimizer.add_param_group(
+                    {'params': [self._sg_directions_cohorts[ci]], 'lr': ta.feature_lr, 'name': f'sg_directions_c{ci}'})
+                self.optimizer.add_param_group(
+                    {'params': [self._sg_sharpness_cohorts[ci]], 'lr': ta.feature_lr * 4.0, 'name': f'sg_sharpness_c{ci}'})
+                self.optimizer.add_param_group(
+                    {'params': [self._sg_rgb_cohorts[ci]], 'lr': ta.feature_lr, 'name': f'sg_rgb_c{ci}'})
 
     def _prune_cohort_param(self, param, mask, group_name, all_groups):
         """Prune a single cohort's Parameter in place; update optimizer state."""
