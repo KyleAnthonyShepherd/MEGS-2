@@ -17,7 +17,7 @@ convergence:
   # machine waits for this many fresh samples (scaled by fraction_changed)
   # before any non-trivial state can fire again. Stalled-timeout promotion
   # also triggers after this many consecutive stalled samples.
-  loss_window: 200
+  loss_window: 256
 
   # Number of recent densify events whose "fraction added" is averaged for
   # the densify saturation signal. Gates the wants_capacity state.
@@ -52,14 +52,14 @@ triggers:
   # "wants_capacity" is the follow-up trigger (just densified, still
   # improving fast — keep going).
   densify:
-    min_iters_between: 60
+    min_iters_between: 32
     require_state: ["stalled", "wants_capacity"]
 
   # Cheap opacity/size prune: drops dead splats (opacity below threshold)
   # and oversized ones. Fires when ≥ fast_prune_dead_fraction of the
   # population is dead AND the monitor allows it.
   fast_prune:
-    min_iters_between: 200
+    min_iters_between: 16
     require_state: ["stalled", "converged"]
 
   # Importance-based prune: removes the bottom prune_ratio1 of Gaussians by
@@ -67,14 +67,14 @@ triggers:
   # more disruptive than fast_prune. Gated on converged so it only fires
   # once per cycle, not on every transient stall.
   lightweight_prune:
-    min_iters_between: 100
-    require_state: ["converged"]
+    min_iters_between: 64
+    require_state: ["stalled"]
 
   # Spherical-Gaussian axis culling: drops dim/low-sharpness directional
   # bases. Runs at most once per convergence cycle in the idle path so it
   # gets a real converged state to act on.
   cull_sg_axes:
-    min_iters_between: 500
+    min_iters_between: 128
     require_state: ["converged"]
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ skipgs:
   # Consecutive "improving" samples after enablement before the gate
   # actually starts skipping. Lets the model settle into the new gradient
   # statistics first.
-  warmup_steady_samples: 50
+  warmup_steady_samples: 64
   # EMA decay on the per-Gaussian contribution signal.
   beta: 0.95
   # Numerical floor on the gate denominator.
@@ -103,7 +103,7 @@ bootstrap:
   # accumulation_views: 4 requires at least 4 images without padding hacks.
   # Until /ingest brings the count to this, the trainer idles in a "waiting
   # for images" state and bootstrap_complete in /status stays false.
-  min_images: 4
+  min_images: 1
 
 # ---------------------------------------------------------------------------
 # training — substantive knobs for each action.
@@ -139,7 +139,7 @@ training:
 
   # Per-Gaussian minimum observation count before densify considers it
   # eligible. Ignores Gaussians that haven't been seen enough yet.
-  densify_min_obs: 10
+  densify_min_obs: 8
 
   # densify fires only if ≥ this fraction of Gaussians are candidates
   # (have high gradient or are in the blur mask). Suppresses futile fires
