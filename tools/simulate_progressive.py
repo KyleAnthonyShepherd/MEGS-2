@@ -476,6 +476,55 @@ def post_one_snapshot(snap_dir: Path, server_url: str, wait: bool):
         _wait_for_integration(server_url, rid)
 
 
+def _counter_path(snapshot_root: Path) -> Path:
+    return snapshot_root / ".next_snapshot"
+
+
+def _read_counter(snapshot_root: Path) -> int:
+    p = _counter_path(snapshot_root)
+    if not p.exists():
+        return 1
+    try:
+        return int(p.read_text().strip())
+    except (ValueError, OSError):
+        return 1
+
+
+def _write_counter(snapshot_root: Path, n: int):
+    _counter_path(snapshot_root).write_text(str(n))
+
+
+def post_next_snapshot(snapshot_root: Path, server_url: str, wait: bool, reset: bool):
+    """POST the next numbered snapshot, tracked by <root>/.next_snapshot.
+
+    Counter starts at 1 and advances on each successful POST.  Run this
+    repeatedly at whatever cadence you want — mid-training, after
+    convergence, with arbitrary delays between calls.
+    """
+    if not snapshot_root.is_dir():
+        sys.exit(f"Not a directory: {snapshot_root}")
+
+    if reset:
+        _write_counter(snapshot_root, 1)
+        print(f"  Reset counter at {_counter_path(snapshot_root)} → 1")
+
+    n = _read_counter(snapshot_root)
+    snap_dir = snapshot_root / str(n)
+    if not snap_dir.is_dir():
+        print(f"  No snapshot {n} in {snapshot_root} — counter at end.")
+        print(f"  To restart from 1, run with --reset.")
+        return
+
+    rid = _post_one(snap_dir, server_url)
+    if rid is None:
+        # Don't advance counter on failure.
+        return
+    _write_counter(snapshot_root, n + 1)
+    print(f"  Counter advanced to {n + 1}")
+    if wait:
+        _wait_for_integration(server_url, rid)
+
+
 def post_snapshots(snapshot_root: Path, server_url: str, delay: float, wait: bool):
     """POST each numbered snapshot directory to a running continuous_train server."""
     import time as _time
@@ -525,6 +574,13 @@ def main():
                         help="Directory of numbered snapshots to POST to a running server")
     parser.add_argument("--post-one", type=Path, default=None, metavar="SNAP_DIR",
                         help="POST a single snapshot directory to a running server and exit")
+    parser.add_argument("--post-next", type=Path, default=None, metavar="ROOT",
+                        help="POST the next snapshot from ROOT, tracked via "
+                             "ROOT/.next_snapshot.  Advance on success.  Run "
+                             "repeatedly at any cadence to drive the trainer "
+                             "manually.")
+    parser.add_argument("--reset", action="store_true",
+                        help="With --post-next, reset the counter to 1 before posting.")
     parser.add_argument("--server", type=str, default="http://127.0.0.1:8765",
                         help="continuous_train server URL (default: http://127.0.0.1:8765)")
     parser.add_argument("--delay", type=float, default=0.0,
@@ -533,6 +589,10 @@ def main():
                         help="Poll /status/{request_id} after each POST until the "
                              "trainer reports state=training or converged.")
     args = parser.parse_args()
+
+    if args.post_next is not None:
+        post_next_snapshot(args.post_next, args.server, args.wait, args.reset)
+        return
 
     if args.post_one is not None:
         post_one_snapshot(args.post_one, args.server, args.wait)
