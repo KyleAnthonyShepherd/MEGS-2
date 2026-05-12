@@ -726,10 +726,14 @@ class SphericalGaussianModel:
         new_data = param[mask]
         for group in all_groups:
             if group['name'] == group_name:
-                stored_state = self.optimizer.state.get(group['params'][0], None)
-                del self.optimizer.state[group['params'][0]]
+                old_param = group['params'][0]
+                stored_state = self.optimizer.state.get(old_param, None)
                 new_param = nn.Parameter(new_data.requires_grad_(True))
+                # Adam only allocates state after the first step() that sees a
+                # non-None grad for this param; sg_* groups can stay state-less
+                # while active_sg_degree==0. Guard both the delete and the move.
                 if stored_state is not None:
+                    del self.optimizer.state[old_param]
                     stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                     stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
                     self.optimizer.state[new_param] = stored_state
