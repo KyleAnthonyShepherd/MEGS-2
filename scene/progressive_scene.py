@@ -68,6 +68,11 @@ class ProgressiveScene:
         self.image_match_matrix: Optional[np.ndarray] = None
         self.image_weights: Optional[np.ndarray] = None
 
+        # Per-image EMA of recent rendering loss. Populated by the trainer
+        # after each per-view loss is computed. Used to bias view selection
+        # toward currently-poorly-rendered images (importance sampling).
+        self.image_error_ema: Dict[str, float] = {}
+
         # Point track info: point_id (int) → list of colmap image_ids
         self._point_track_info: Dict[int, List[int]] = {}
         self._current_sfm_xyz: Optional[np.ndarray] = None

@@ -161,6 +161,17 @@ training:
   # Currently unused (legacy).
   fast_final_prune_ratio: 0.10
 
+  # Importance sampling on rendering loss. When true, bias view selection
+  # toward images with high recent loss EMA — useful when new images get
+  # added mid-training and their gradient signal would otherwise be
+  # drowned out by well-fit older images. Loss-gradient weighting
+  # (cam_w * base_loss) still uses raw match-matrix weights only, to avoid
+  # double-counting.
+  image_error_weighting: true
+  # EMA decay on per-image base_loss. Higher = smoother, slower to react;
+  # lower = more responsive but noisier. 0.95 → half-life of ~14 samples.
+  image_error_ema_beta: 0.95
+
 # ---------------------------------------------------------------------------
 # dense_init — per-image dense seeding via Depth-Anything-V2 on each ingest.
 # ---------------------------------------------------------------------------
