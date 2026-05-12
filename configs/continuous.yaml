@@ -11,7 +11,9 @@ convergence:
 triggers:
   densify:
     min_iters_between: 60
-    require_state: ["wants_capacity"]
+    # "stalled" is the bootstrap trigger (plateau → need capacity).
+    # "wants_capacity" is the follow-up trigger (just densified, still improving fast).
+    require_state: ["stalled", "wants_capacity"]
   fast_prune:
     min_iters_between: 200
     require_state: ["stalled", "converged"]
