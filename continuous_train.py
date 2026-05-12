@@ -707,7 +707,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 if gaussians._xyz.shape[0] < tc.num_max_ceiling:
                     d_cfg = cfg.triggers.densify
                     if should_densify(
-                        monitor, gaussians, opt, mask_blur,
+                        cur_state, gaussians, opt, mask_blur,
                         iters_since_last=iters_since_densify,
                         candidate_fraction=tc.densify_candidate_fraction,
                         min_obs=tc.densify_min_obs,
@@ -730,8 +730,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 # ---- Fast prune ----
                 fp_cfg = cfg.triggers.fast_prune
                 if should_fast_prune(
-                    gaussians, opt, tc.fast_prune_dead_fraction,
-                    monitor=monitor,
+                    cur_state, gaussians, opt, tc.fast_prune_dead_fraction,
                     iters_since_last=iters_since_fast_prune,
                     min_iters_between=fp_cfg.min_iters_between,
                     require_states=tuple(fp_cfg.require_state),
@@ -749,7 +748,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 # ---- Lightweight importance prune ----
                 lw_cfg = cfg.triggers.lightweight_prune
                 if should_lightweight_prune(
-                    gaussians, monitor, n_at_last_prune, soft_cap,
+                    cur_state, gaussians, n_at_last_prune, soft_cap,
                     iters_since_last=iters_since_lw_prune,
                     min_iters_between=lw_cfg.min_iters_between,
                     growth_threshold=tc.lightweight_prune_growth_threshold,
@@ -769,7 +768,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 if monitor.cycle > cycle_at_last_cull:
                     cull_cfg = cfg.triggers.cull_sg_axes
                     if should_cull_sg_axes(
-                        gaussians, monitor, tc.sharpness_threshold,
+                        cur_state, gaussians, tc.sharpness_threshold,
                         fraction_low=tc.sg_axis_cull_low_fraction,
                         iters_since_last=iters_since_cull,
                         min_iters_between=cull_cfg.min_iters_between,
@@ -808,7 +807,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
             if monitor.cycle > cycle_at_last_cull:
                 cull_cfg = cfg.triggers.cull_sg_axes
                 if should_cull_sg_axes(
-                    gaussians, monitor, tc.sharpness_threshold,
+                    cur_state, gaussians, tc.sharpness_threshold,
                     fraction_low=tc.sg_axis_cull_low_fraction,
                     iters_since_last=iters_since_cull,
                     min_iters_between=cull_cfg.min_iters_between,
