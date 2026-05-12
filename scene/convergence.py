@@ -4,7 +4,11 @@ from collections import deque
 class ConvergenceMonitor:
     def __init__(self, loss_window=200, densify_window=10):
         self.loss_history = deque(maxlen=loss_window)
+        # Each entry is (iter, fraction_added). Entries older than loss_window
+        # iters are dropped by densify_saturation() so a single past densify
+        # doesn't keep "wants_capacity" pinned forever.
         self.densify_history = deque(maxlen=densify_window)
+        self._iter = 0
         # Bumped on every reset(); used by callers that want to fire "once
         # per convergence cycle" (e.g. SG axis cull).
         self.cycle = 0
@@ -15,9 +19,10 @@ class ConvergenceMonitor:
 
     def update_loss(self, ema_loss: float):
         self.loss_history.append(ema_loss)
+        self._iter += 1
 
     def update_densify(self, n_added: int, n_total: int):
-        self.densify_history.append(n_added / max(n_total, 1))
+        self.densify_history.append((self._iter, n_added / max(n_total, 1)))
 
     def reset(self, fraction_changed: float = 1.0):
         """Clear loss history after a structural scene change.
@@ -45,7 +50,11 @@ class ConvergenceMonitor:
     def densify_saturation(self) -> float:
         if not self.densify_history:
             return 0.0
-        return max(self.densify_history)
+        horizon = self._iter - self.loss_history.maxlen
+        recent = [frac for (it, frac) in self.densify_history if it > horizon]
+        if not recent:
+            return 0.0
+        return max(recent)
 
     def state(self,
               converged_slope=-1e-4,
