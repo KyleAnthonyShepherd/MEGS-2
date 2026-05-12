@@ -103,7 +103,7 @@ bootstrap:
   # accumulation_views: 4 requires at least 4 images without padding hacks.
   # Until /ingest brings the count to this, the trainer idles in a "waiting
   # for images" state and bootstrap_complete in /status stays false.
-  min_images: 1
+  min_images: 4
 
 # ---------------------------------------------------------------------------
 # training — substantive knobs for each action.
@@ -111,7 +111,7 @@ bootstrap:
 training:
   # Number of view micro-batches per optimizer step (gradient accumulation).
   # MUST equal bootstrap.min_images or be ≤ it.
-  accumulation_views: 4
+  accumulation_views: 1
 
   # Hard VRAM-bounded ceiling on total Gaussian count. lightweight_prune
   # auto-fires above num_max_ceiling * 0.85 regardless of state to keep
