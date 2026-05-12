@@ -525,6 +525,12 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
     tc = cfg.training
     soft_cap = int(tc.num_max_ceiling * 0.85)
 
+    # Pre-tuple require_state lists once; called every iter from triggers.
+    require_states_densify = tuple(cfg.triggers.densify.require_state)
+    require_states_fast_prune = tuple(cfg.triggers.fast_prune.require_state)
+    require_states_lw_prune = tuple(cfg.triggers.lightweight_prune.require_state)
+    require_states_cull = tuple(cfg.triggers.cull_sg_axes.require_state)
+
     # Per-action iteration counters for anti-thrash floors
     iters_since_densify = 0
     iters_since_fast_prune = 0
@@ -569,7 +575,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     prog_scene.current_basic_pcd, prog_scene.cameras_extent,
                     birth_iter=global_iter)
                 gaussians.training_setup(opt)
-                mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
+                mask_blur = None
                 n_at_last_prune = gaussians._xyz.shape[0]
 
             # Retrofit existing cohort LR schedules to the current scene scale,
@@ -649,13 +655,12 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 and ctrl.queue_depth == 0
                 and not ctrl.checkpoint_pending()):
             if monitor.cycle > cycle_at_last_cull:
-                cull_cfg = cfg.triggers.cull_sg_axes
                 if should_cull_sg_axes(
                     cur_state, gaussians, tc.sharpness_threshold,
                     fraction_low=tc.sg_axis_cull_low_fraction,
                     iters_since_last=iters_since_cull,
-                    min_iters_between=cull_cfg.min_iters_between,
-                    require_states=tuple(cull_cfg.require_state),
+                    min_iters_between=cfg.triggers.cull_sg_axes.min_iters_between,
+                    require_states=require_states_cull,
                 ):
                     n_unchanged = gaussians._xyz.shape[0]
                     gaussians.cull_low_sharpness_axes(
@@ -698,44 +703,52 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
         else:
             selection_weights = prog_scene.image_weights
 
+        # Build the candidate pool once per outer iter. select_cameras_weighted
+        # does np.argsort + set construction; doing it K times is wasted work
+        # when the underlying weights don't change between micro-batches.
+        if selection_weights is not None:
+            candidates = select_cameras_weighted(
+                cameras, selection_weights, n_top=10, n_random=10)
+            if not candidates:
+                candidates = cameras
+        else:
+            candidates = None
+
         per_view_packs = []
-        for _sub in range(K):
-            if selection_weights is not None:
-                candidates = select_cameras_weighted(
-                    cameras, selection_weights, n_top=10, n_random=10)
-                if not candidates:
-                    candidates = cameras
-                vcam = candidates[randint(0, len(candidates) - 1)]
-                cam_idx = prog_scene._cam_name_to_idx.get(vcam.image_name, 0)
-                # Loss weighting (cam_w) keeps using the raw match-matrix
-                # weight — error_ema only biases selection, not gradient
-                # contribution, to avoid double-counting.
-                cam_w = float(prog_scene.image_weights[cam_idx]) \
-                    if cam_idx < len(prog_scene.image_weights) else 1.0
-            else:
-                if not viewpoint_stack:
-                    viewpoint_stack = cameras.copy()
-                vcam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-                cam_w = 1.0
+        with gaussians.stable_views():
+            for _sub in range(K):
+                if candidates is not None:
+                    vcam = candidates[randint(0, len(candidates) - 1)]
+                    cam_idx = prog_scene._cam_name_to_idx.get(vcam.image_name, 0)
+                    # Loss weighting (cam_w) keeps using the raw match-matrix
+                    # weight — error_ema only biases selection, not gradient
+                    # contribution, to avoid double-counting.
+                    cam_w = float(prog_scene.image_weights[cam_idx]) \
+                        if cam_idx < len(prog_scene.image_weights) else 1.0
+                else:
+                    if not viewpoint_stack:
+                        viewpoint_stack = cameras.copy()
+                    vcam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+                    cam_w = 1.0
 
-            bg = torch.rand((3,), device="cuda") if opt.random_background else background
-            render_pkg = render_imp(vcam, gaussians, pipe, bg, is_training=True)
-            img = render_pkg["render"]
-            gt_image = vcam.original_image.cuda()
+                bg = torch.rand((3,), device="cuda") if opt.random_background else background
+                render_pkg = render_imp(vcam, gaussians, pipe, bg, is_training=True)
+                img = render_pkg["render"]
+                gt_image = vcam.original_image.cuda()
 
-            Ll1 = l1_loss(img, gt_image)
-            if FUSED_SSIM_AVAILABLE:
-                ssim_val = fused_ssim(img.unsqueeze(0), gt_image.unsqueeze(0))
-            else:
-                ssim_val = ssim(img, gt_image)
+                Ll1 = l1_loss(img, gt_image)
+                if FUSED_SSIM_AVAILABLE:
+                    ssim_val = fused_ssim(img.unsqueeze(0), gt_image.unsqueeze(0))
+                else:
+                    ssim_val = ssim(img, gt_image)
 
-            base_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
-            if tc.image_error_weighting:
-                ema = prog_scene.image_error_ema
-                prev = ema.get(vcam.image_name, float(base_loss.detach()))
-                beta = tc.image_error_ema_beta
-                ema[vcam.image_name] = beta * prev + (1.0 - beta) * float(base_loss.detach())
-            per_view_packs.append((cam_w * base_loss, render_pkg, vcam.uid, vcam.image_name, cam_w))
+                base_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_val)
+                if tc.image_error_weighting:
+                    ema = prog_scene.image_error_ema
+                    prev = ema.get(vcam.image_name, float(base_loss.detach()))
+                    beta = tc.image_error_ema_beta
+                    ema[vcam.image_name] = beta * prev + (1.0 - beta) * float(base_loss.detach())
+                per_view_packs.append((cam_w * base_loss, render_pkg, vcam.uid, vcam.image_name, cam_w))
 
         # SkipGS gating — uses cur_state snapshotted at top of loop
         if skipgs is not None:
@@ -750,6 +763,13 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
 
         contributing = [loss_t for (loss_t, _, _, _, _), g in zip(per_view_packs, gate) if g]
 
+        # mask_blur survives across iters; resize/clear if N changed since last
+        # iter (densify/prune in the prior iter would have done that). One bool
+        # buffer reused via in-place |= avoids K size-N alloc+copy pairs per iter.
+        n_total = gaussians._xyz.shape[0]
+        if mask_blur is None or mask_blur.shape[0] != n_total:
+            mask_blur = torch.zeros(n_total, dtype=torch.bool, device="cuda")
+
         if not contributing:
             if skipgs is not None:
                 skipgs.record_backward(False)
@@ -760,12 +780,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     gaussians.max_radii2D[vf] = torch.max(gaussians.max_radii2D[vf], rad[vf])
                     am = render_pkg["area_max"]
                     ri = render_pkg["render"]
-                    if mask_blur is None:
-                        mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
-                    mbp = torch.zeros(gaussians._xyz.shape[0], device="cuda")
-                    if mask_blur.shape[0] <= gaussians._xyz.shape[0]:
-                        mbp[:mask_blur.shape[0]] = mask_blur
-                    mask_blur = torch.logical_or(mbp, am > (ri.shape[1] * ri.shape[2] / 5000))
+                    mask_blur |= am > (ri.shape[1] * ri.shape[2] / 5000)
         else:
             loss = sum(contributing)
             loss.backward()
@@ -782,25 +797,19 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     am = render_pkg["area_max"]
                     ri = render_pkg["render"]
                     gaussians.max_radii2D[vf] = torch.max(gaussians.max_radii2D[vf], rad[vf])
-                    if mask_blur is None:
-                        mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
-                    mbp = torch.zeros(gaussians._xyz.shape[0], device="cuda")
-                    if mask_blur.shape[0] <= gaussians._xyz.shape[0]:
-                        mbp[:mask_blur.shape[0]] = mask_blur
-                    mask_blur = torch.logical_or(mbp, am > (ri.shape[1] * ri.shape[2] / 5000))
+                    mask_blur |= am > (ri.shape[1] * ri.shape[2] / 5000)
                     if g:
                         gaussians.add_densification_stats(render_pkg["viewspace_points"], vf)
 
                 # ---- Densify ----
                 if gaussians._xyz.shape[0] < tc.num_max_ceiling:
-                    d_cfg = cfg.triggers.densify
                     if should_densify(
                         cur_state, gaussians, opt, mask_blur,
                         iters_since_last=iters_since_densify,
                         candidate_fraction=tc.densify_candidate_fraction,
                         min_obs=tc.densify_min_obs,
-                        min_iters_between=d_cfg.min_iters_between,
-                        require_states=tuple(d_cfg.require_state),
+                        min_iters_between=cfg.triggers.densify.min_iters_between,
+                        require_states=require_states_densify,
                     ):
                         n_before = gaussians._xyz.shape[0]
                         gaussians.densify_and_prune_split(
@@ -812,16 +821,16 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                         monitor.update_densify(max(n_after - n_before, 0), n_after)
                         fraction_changed = abs(n_after - n_before) / max(n_after, 1)
                         monitor.reset(fraction_changed=fraction_changed)
-                        mask_blur = torch.zeros(gaussians._xyz.shape[0], device="cuda")
+                        # mask_blur is reallocated at the top of the next iter
+                        # when n_total changes; no need to reset here.
                         iters_since_densify = 0
 
                 # ---- Fast prune ----
-                fp_cfg = cfg.triggers.fast_prune
                 if should_fast_prune(
                     cur_state, gaussians, opt, tc.fast_prune_dead_fraction,
                     iters_since_last=iters_since_fast_prune,
-                    min_iters_between=fp_cfg.min_iters_between,
-                    require_states=tuple(fp_cfg.require_state),
+                    min_iters_between=cfg.triggers.fast_prune.min_iters_between,
+                    require_states=require_states_fast_prune,
                 ):
                     n_before_fp = gaussians._xyz.shape[0]
                     gaussians.opacity_size_prune(
@@ -834,13 +843,12 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     iters_since_fast_prune = 0
 
                 # ---- Lightweight importance prune ----
-                lw_cfg = cfg.triggers.lightweight_prune
                 if should_lightweight_prune(
                     cur_state, gaussians, n_at_last_prune, soft_cap,
                     iters_since_last=iters_since_lw_prune,
-                    min_iters_between=lw_cfg.min_iters_between,
+                    min_iters_between=cfg.triggers.lightweight_prune.min_iters_between,
                     growth_threshold=tc.lightweight_prune_growth_threshold,
-                    require_states=tuple(lw_cfg.require_state),
+                    require_states=require_states_lw_prune,
                 ):
                     n_before_prune = gaussians._xyz.shape[0]
                     run_lightweight_prune(gaussians, prog_scene, opt, cfg, global_iter)
