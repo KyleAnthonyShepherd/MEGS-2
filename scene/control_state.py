@@ -1,13 +1,16 @@
 import threading
+import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 
 @dataclass
 class IngestRequest:
     snapshot_dir: str
     request_id: str
+    session_id: Optional[str] = None
+    image_name: Optional[str] = None
 
 
 class ControlState:
@@ -23,6 +26,16 @@ class ControlState:
         # Per-request lifecycle: request_id -> state string
         self._request_states: Dict[str, str] = {}
 
+        # Idempotency ledger: (session_id, image_name) -> request_id.
+        # The upstream server may retry an ingest POST; a duplicate must be
+        # a no-op that reports the original request's id.
+        self._seen_images: Dict[Tuple[str, str], str] = {}
+
+        # Session pinning: this trainer process serves one capture session.
+        # Set on the first session-tagged ingest; later mismatches are
+        # rejected by the HTTP layer with 409.
+        self.session_id: Optional[str] = None
+
         # Pending checkpoint flag; trainer sets _last_snapshot_path and clears this
         self._checkpoint_requested: bool = False
         self._checkpoint_done: bool = False
@@ -34,20 +47,43 @@ class ControlState:
         self.queue_depth: int = 0
         self.n_images: int = 0
         self.bootstrap_complete: bool = False
+        self.iter: int = 0
+        self.last_ingest: Optional[float] = None  # epoch seconds of last accepted ingest
 
     # ------------------------------------------------------------------
     # Ingest queue
     # ------------------------------------------------------------------
 
-    def enqueue_ingest(self, snapshot_dir: str, request_id: Optional[str] = None) -> str:
-        if not request_id:
-            request_id = str(uuid.uuid4())
+    def enqueue_ingest(self, snapshot_dir: str, request_id: Optional[str] = None,
+                       session_id: Optional[str] = None,
+                       image_name: Optional[str] = None) -> Tuple[str, bool]:
+        """Enqueue a snapshot for integration.
+
+        Returns (request_id, duplicate). When (session_id, image_name) has
+        been seen before, nothing is enqueued and the original request_id is
+        returned with duplicate=True.
+        """
         with self._cond:
-            self._ingest_queue.append(IngestRequest(snapshot_dir, request_id))
+            if session_id and image_name:
+                key = (session_id, image_name)
+                existing = self._seen_images.get(key)
+                if existing is not None:
+                    return existing, True
+
+            if not request_id:
+                request_id = str(uuid.uuid4())
+            if session_id and image_name:
+                self._seen_images[(session_id, image_name)] = request_id
+            if session_id and self.session_id is None:
+                self.session_id = session_id
+
+            self._ingest_queue.append(
+                IngestRequest(snapshot_dir, request_id, session_id, image_name))
             self._request_states[request_id] = "queued"
             self.queue_depth = len(self._ingest_queue)
+            self.last_ingest = time.time()
             self._cond.notify_all()
-        return request_id
+        return request_id, False
 
     def drain_ingest_queue(self) -> list:
         with self._cond:
@@ -111,13 +147,16 @@ class ControlState:
     # ------------------------------------------------------------------
 
     def update_status(self, gaussian_count: int, monitor_state: str,
-                      n_images: int, bootstrap_complete: bool):
+                      n_images: int, bootstrap_complete: bool,
+                      iteration: Optional[int] = None):
         with self._lock:
             self.gaussian_count = gaussian_count
             self.monitor_state = monitor_state
             self.n_images = n_images
             self.bootstrap_complete = bootstrap_complete
             self.queue_depth = len(self._ingest_queue)
+            if iteration is not None:
+                self.iter = iteration
 
     def status_snapshot(self) -> dict:
         with self._lock:
@@ -128,4 +167,33 @@ class ControlState:
                 "queue_depth": self.queue_depth,
                 "n_images": self.n_images,
                 "bootstrap_complete": self.bootstrap_complete,
+                "session_id": self.session_id,
+                "iter": self.iter,
+                "last_ingest": self.last_ingest,
             }
+
+    def health_snapshot(self) -> dict:
+        """Health payload per the home-server contract (app/api/trainer.py):
+        keys state, iter, splat_count, queue_depth, last_ingest, vram_mb."""
+        with self._lock:
+            return {
+                "state": self.monitor_state,
+                "iter": self.iter,
+                "splat_count": self.gaussian_count,
+                "queue_depth": len(self._ingest_queue),
+                "last_ingest": self.last_ingest,
+                "vram_mb": _vram_mb(),
+                "session_id": self.session_id,
+                "n_images": self.n_images,
+                "bootstrap_complete": self.bootstrap_complete,
+            }
+
+
+def _vram_mb() -> Optional[float]:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
+    except Exception:
+        pass
+    return None

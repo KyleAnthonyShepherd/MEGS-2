@@ -227,7 +227,8 @@ dense_init:
 # ---------------------------------------------------------------------------
 http:
   host: "127.0.0.1"
-  port: 8765
+  # Matches the home-server's TRAINER_URL default (http://127.0.0.1:8666).
+  port: 8666
   # Max seconds a POST /checkpoint will block waiting for the trainer to
   # actually write the .ply. 0 = no timeout.
   checkpoint_timeout: 30

@@ -98,3 +98,71 @@ def test_compute_image_weights_fallback_no_zeros():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Home-server producer format (app/api/trainer.py export_match_matrix):
+# one name per line, space-separated matrix rows.
+# ---------------------------------------------------------------------------
+
+def _write_files_home_server(tmpdir, matrix_rows, names):
+    matrix_path = os.path.join(tmpdir, "imageMatchMatrix.txt")
+    names_path = os.path.join(tmpdir, "imagesNames.txt")
+    with open(matrix_path, "w") as f:
+        for row in matrix_rows:
+            f.write(" ".join(str(x) for x in row) + "\n")
+    with open(names_path, "w") as f:
+        f.write("\n".join(names) + "\n")
+    return matrix_path, names_path
+
+
+def test_parse_home_server_format():
+    """Newline-separated names + space-separated rows must parse identically
+    to the legacy comma format."""
+    rows = [[0, 10, 5], [10, 0, 8], [5, 8, 0]]
+    names = ["img_a.jpg", "img_b.jpg", "img_c.jpg"]
+    ordered = ["img_a", "img_b", "img_c"]
+    with tempfile.TemporaryDirectory() as tmp_a, \
+            tempfile.TemporaryDirectory() as tmp_b:
+        legacy = parse_match_matrix(*_write_files(tmp_a, rows, names), ordered)
+        new = parse_match_matrix(
+            *_write_files_home_server(tmp_b, rows, names), ordered)
+    np.testing.assert_allclose(new, legacy)
+
+
+def test_parse_home_server_format_l7_reindex():
+    """Landmine L7: DB/registration row order != alphabetical camera order.
+    Weights must land on the correct cameras after reindexing."""
+    # File (registration) order: C, A, B — deliberately non-alphabetical.
+    # C↔A = 100, C↔B = 0, A↔B = 50
+    rows = [[0, 100, 0], [100, 0, 50], [0, 50, 0]]
+    names = ["img_c.jpg", "img_a.jpg", "img_b.jpg"]
+    # Camera order (MEGS-2 loader): alphabetical
+    ordered = ["img_a", "img_b", "img_c"]
+    with tempfile.TemporaryDirectory() as tmp:
+        result = parse_match_matrix(
+            *_write_files_home_server(tmp, rows, names), ordered)
+    # a↔c strongest link: row a max is 100 (vs c) → normalised 1.0
+    assert abs(result[0, 2] - 1.0) < 1e-5
+    assert abs(result[2, 0] - 1.0) < 1e-5
+    # a↔b weaker: log(51)/log(101)
+    expected_ab = np.log1p(50) / np.log1p(100)
+    assert abs(result[0, 1] - expected_ab) < 1e-5
+    # b↔c never matched
+    assert result[1, 2] == 0.0
+
+    # And weight computation maps to the right cameras: new image = c (idx 2).
+    # Per-row log-normalisation makes each image's strongest link 1.0, so both
+    # a (direct) and b (via a) end up connected; the essential property is
+    # that no camera got dropped by misindexing.
+    weights = compute_image_weights(result, [2])
+    assert weights[2] == 1.0
+    assert weights[0] > 0.0 and weights[1] > 0.0
+
+
+def test_parse_single_image_home_server_format():
+    """A 1-image session: single name line, single '0' row."""
+    with tempfile.TemporaryDirectory() as tmp:
+        result = parse_match_matrix(
+            *_write_files_home_server(tmp, [[0]], ["img_a.jpg"]), ["img_a"])
+    assert result.shape == (1, 1) and result[0, 0] == 0.0

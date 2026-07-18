@@ -15,6 +15,7 @@ Usage:
 import gc
 import logging
 import os
+import shutil
 import sys
 import uuid
 from argparse import ArgumentParser, Namespace
@@ -147,7 +148,7 @@ class DenseInitConfig:
 @dataclass
 class HttpConfig:
     host: str = "127.0.0.1"
-    port: int = 8765
+    port: int = 8666
     checkpoint_timeout: float = 30.0
 
 
@@ -477,14 +478,31 @@ def run_lightweight_prune(gaussians, prog_scene, opt, cfg, global_iter):
 # Atomic snapshot write
 # ---------------------------------------------------------------------------
 
-def write_snapshot_atomic(model_path: str, gaussians: SphericalGaussianModel) -> str:
-    """Write current.ply atomically; return final path."""
+def write_snapshot_atomic(model_path: str, gaussians: SphericalGaussianModel,
+                          export_dir: Optional[str] = None,
+                          session_id: Optional[str] = None) -> str:
+    """Write current.ply atomically; return final path.
+
+    When export_dir and session_id are set, also mirror the snapshot to
+    <export_dir>/<session_id>/latest.ply — the path the home-server's
+    viewer reads (app/api/trainer.py latest_splat_ply)."""
     out_dir = Path(model_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / "current.ply.tmp"
     final = out_dir / "current.ply"
     gaussians.save_ply(str(tmp))
     os.replace(str(tmp), str(final))
+
+    if export_dir and session_id:
+        try:
+            exp_dir = Path(export_dir) / session_id
+            exp_dir.mkdir(parents=True, exist_ok=True)
+            exp_tmp = exp_dir / "latest.ply.tmp"
+            shutil.copyfile(final, exp_tmp)
+            os.replace(str(exp_tmp), str(exp_dir / "latest.ply"))
+        except OSError as e:
+            logger.warning(f"[snapshot] export mirror failed: {e}")
+
     return str(final)
 
 
@@ -545,6 +563,8 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
     global_iter = 0
     ema_loss = 0.0
     bootstrapped = False
+    warned_no_match_matrix = False
+    export_dir = getattr(args, 'export_dir', None) or None
 
     _persistent_dav2 = None
     if cfg.dense_init.persist_model:
@@ -555,7 +575,8 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
     while True:
         # ---- 1. Handle pending checkpoint ----
         if ctrl.checkpoint_pending():
-            path = write_snapshot_atomic(model_path, gaussians)
+            path = write_snapshot_atomic(model_path, gaussians,
+                                         export_dir, ctrl.session_id)
             ctrl.complete_checkpoint(path)
             logger.info(f"[checkpoint] wrote {path}")
 
@@ -608,6 +629,13 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 prog_scene.image_weights = compute_image_weights(
                     prog_scene.image_match_matrix, new_cam_indices)
             else:
+                if not warned_no_match_matrix:
+                    logger.warning(
+                        "[ingest] no imageMatchMatrix.txt/imagesNames.txt in "
+                        f"{prog_scene.snapshot_dir}/sparse/0 — using uniform "
+                        "weights with new-camera bias (L8 fallback); this "
+                        "warning is logged once")
+                    warned_no_match_matrix = True
                 M = len(prog_scene.train_cameras)
                 weights = np.ones(M, dtype=np.float32) * 0.5
                 for i in new_cam_indices:
@@ -638,6 +666,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
             ) if n_images_now > 0 else "initializing",
             n_images=n_images_now,
             bootstrap_complete=bootstrapped,
+            iteration=global_iter,
         )
 
         if not bootstrapped:
@@ -678,7 +707,8 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     continue
 
             if wrote_current_at_cycle != monitor.cycle:
-                path = write_snapshot_atomic(model_path, gaussians)
+                path = write_snapshot_atomic(model_path, gaussians,
+                                             export_dir, ctrl.session_id)
                 wrote_current_at_cycle = monitor.cycle
                 logger.info(f"[converged] Wrote {path}; idling until next ingest or checkpoint")
             ctrl.update_status(
@@ -686,6 +716,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 monitor_state="converged",
                 n_images=prog_scene.n_images,
                 bootstrap_complete=bootstrapped,
+                iteration=global_iter,
             )
             ctrl.wait_for_work(timeout=5.0)
             continue
@@ -892,6 +923,11 @@ def main():
     parser.add_argument("--config", type=str, default="configs/continuous.yaml")
     parser.add_argument("--http_host", type=str, default=None)
     parser.add_argument("--http_port", type=int, default=None)
+    parser.add_argument(
+        "--export_dir", type=str,
+        default=os.environ.get("TRAINER_EXPORT_DIR", ""),
+        help="Mirror snapshots to <export_dir>/<session_id>/latest.ply for the "
+             "home-server viewer (defaults to $TRAINER_EXPORT_DIR)")
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()

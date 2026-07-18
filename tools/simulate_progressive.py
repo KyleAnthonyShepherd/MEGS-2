@@ -413,7 +413,7 @@ def build_snapshots(source: Path, output: Path, n_init: int, step: int,
     print(f"    --config configs/continuous.yaml")
     print()
     print(f"  # Then post each snapshot in order, e.g.:")
-    print(f"  python tools/simulate_progressive.py --post-snapshots {output} --server http://127.0.0.1:8765")
+    print(f"  python tools/simulate_progressive.py --post-snapshots {output} --server http://127.0.0.1:8666")
 
 
 # ---------------------------------------------------------------------------
@@ -581,8 +581,8 @@ def main():
                              "manually.")
     parser.add_argument("--reset", action="store_true",
                         help="With --post-next, reset the counter to 1 before posting.")
-    parser.add_argument("--server", type=str, default="http://127.0.0.1:8765",
-                        help="continuous_train server URL (default: http://127.0.0.1:8765)")
+    parser.add_argument("--server", type=str, default="http://127.0.0.1:8666",
+                        help="continuous_train server URL (default: http://127.0.0.1:8666)")
     parser.add_argument("--delay", type=float, default=0.0,
                         help="Seconds to wait between POST requests (default: 0)")
     parser.add_argument("--wait", action="store_true",
