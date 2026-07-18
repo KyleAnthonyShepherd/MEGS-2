@@ -1,5 +1,26 @@
 # Implementation Notes: Progressive MEGS²
 
+## Landmine → test coverage (Milestone 6 index)
+
+Items below that are now enforced by tests are listed here and kept in the
+prose only for background. When a landmine bites again, its test is the
+first thing to re-read.
+
+| Landmine | Enforced by |
+|---|---|
+| L7 — matrix row order ≠ camera order | `tests/test_match_matrix.py::test_parse_match_matrix_reorder`, `::test_parse_home_server_format_l7_reindex` |
+| L8 — match-matrix files may not exist | uniform-fallback branch logs one WARNING (`continuous_train.py`); home-server now exports the files (`docs/ingest_contract.md`); format round-trip in `tests/test_match_matrix.py::test_parse_home_server_format` |
+| DL2 — DAv2 outputs disparity, DA3 outputs depth | `tests/test_dense_init_da3.py::test_validate_alignment_*` (sign gate per backend) |
+| T1 — Adam state lost on rebind after prune | `tests/test_optim_guard.py` (+ always-on `check_invariants`) |
+| Grace ranges stale after prune / mid-order densify append | `tests/test_index_remap.py` (incl. simulated historical misalignment) |
+| `_sg_axis_count` / split prune-mask end-append misalignment | `tests/test_index_remap.py::test_simulated_axis_count_stays_aligned_through_clone_and_prune`, `::test_perm_gathers_endcat_into_final_order` |
+| Scheduler bugs: densify_saturation never aging out; stalled grinding forever | `tests/test_convergence.py::test_densify_saturation_ages_out_by_iter`, `::test_plateau_reads_stalled_then_promotes_to_converged` |
+| Idle must not burn GPU when converged | converged-idle gate in `continuous_train.py` (structure); state reachability pinned in `tests/test_convergence.py` |
+| Trigger require-state / anti-thrash floors | `tests/test_triggers.py` (every predicate branch) |
+| SkipGS budget floor / warmup lifecycle | `tests/test_skipgs.py` |
+| Ingest retries must be no-ops (incl. across restarts) | `tests/test_continuous_server.py::test_ingest_duplicate_is_200_noop`, `tests/test_train_state.py::test_ledger_round_trip_preserves_idempotency` |
+| Gravity/camera-convention math (DL1/DL3) | `tests/test_dense_init.py` geometry tests; conditioning matrices in `tests/test_dense_init_da3.py::test_conditioning_matrices` |
+
 ## Codebase Reconnaissance (Phase 1 answers)
 
 ### MEGS-2 train.py iteration structure
@@ -91,7 +112,12 @@ This preserves accumulated gradient statistics for existing Gaussians across sna
 
 1. **`variable_sg_bands`**: MEGS-2's model can run in `variable_sg_bands=True` mode (list-based tensors per degree) or unified tensor mode (single tensor). `_initialize_spherical_gaussians_unified` always creates unified tensors (the training path). `expand_from_pcd` assumes unified tensors (same as `create_from_pcd`). If `load_ply` was called first (which switches to variable_sg_bands mode with lists), `expand_from_pcd` would need adaptation. For the progressive use case we always start from `create_from_pcd` so this is not an issue.
 
-2. **Adapter writes**: The implementation assumes the upstream GLOMAP pipeline writes `imageMatchMatrix.txt` and `imagesNames.txt` per the GS_On-The-Fly spec. If they don't, match-matrix weighting silently falls back to uniform weights with new-camera bias (see `progressive_train.py` fallback branch). **Flag this to the user** (Landmine L8).
+2. **Adapter writes (L8 — resolved)**: The home-server now exports
+   `imageMatchMatrix.txt`/`imagesNames.txt` into the promoted `sparse/0`
+   (newline/space format, auto-detected by `parse_match_matrix`; see
+   `docs/ingest_contract.md`). When absent, the fallback to uniform
+   weights with new-camera bias logs one clear WARNING instead of being
+   silent.
 
 3. **`cull_low_sharpness_axes` with unified tensors**: The model after `create_from_pcd` uses unified `(N, max_sg_degree, 3)` tensors, and `cull_low_sharpness_axes` accesses `self._sg_directions.shape` directly — this works for the unified path. If `variable_sg_bands=True` with list tensors, a different code path would be needed.
 

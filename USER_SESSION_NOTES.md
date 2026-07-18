@@ -1,5 +1,10 @@
 # User Setup Session Notes
 # Saved: 2026-05-08
+#
+# Historical environment-setup log. Current pipeline reference lives in
+# docs/continuous_pipeline.md (state machine, config, VRAM budget) with
+# ops in docs/continuous_ops.md and the server contract in
+# docs/ingest_contract.md.
 
 ## Hardware
 GPU: NVIDIA GeForce GTX 1660 Ti
