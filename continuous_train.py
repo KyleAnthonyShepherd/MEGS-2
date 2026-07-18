@@ -47,6 +47,7 @@ from scene.triggers import (
 from scene.skipgs import SkipGSGate
 from scene.control_state import ControlState
 from scene.event_log import EventLog
+from scene.optim_guard import optimizer_binding_ok
 from spherical_gaussian_renderer import render_imp
 from utils.loss_utils import l1_loss, ssim
 from utils.graphics_utils import BasicPointCloud
@@ -521,6 +522,29 @@ def run_lightweight_prune(gaussians, prog_scene, opt, cfg, global_iter):
 
 
 # ---------------------------------------------------------------------------
+# In-loop invariants (Plan 2 Milestone 2.2/2.3) — cheap, always-on. Violations
+# never crash training: they log an error and emit an invariant_violation
+# event, which the regression harness's trigger-sequence diff will surface.
+# ---------------------------------------------------------------------------
+
+def check_invariants(gaussians, tc, evlog, global_iter, where):
+    n = gaussians._xyz.shape[0]
+    if n > tc.num_max_ceiling:
+        logger.error(
+            f"[invariant] splat count {n} exceeds VRAM ceiling "
+            f"{tc.num_max_ceiling} after {where}")
+        evlog.emit("invariant_violation", kind="ceiling_exceeded",
+                   iter=global_iter, where=where, splat_count=n,
+                   ceiling=tc.num_max_ceiling)
+    if not optimizer_binding_ok(getattr(gaussians, "optimizer", None)):
+        logger.error(
+            f"[invariant] optimizer state keyed by stale params after {where} "
+            "— Adam momentum was lost (T1 regression)")
+        evlog.emit("invariant_violation", kind="optimizer_binding",
+                   iter=global_iter, where=where)
+
+
+# ---------------------------------------------------------------------------
 # Atomic snapshot write
 # ---------------------------------------------------------------------------
 
@@ -803,6 +827,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 skipgs._enabled = False
                 skipgs._steady_count = 0
 
+            check_invariants(gaussians, tc, evlog, global_iter, "ingest")
             last_snapshot_dir = req.snapshot_dir
             evlog.emit("ingest", iter=global_iter,
                        snapshot_dir=req.snapshot_dir,
@@ -1012,8 +1037,11 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                             opt.densify_grad_threshold, 0.005,
                             prog_scene.cameras_extent, None,
                             mask_blur[:gaussians.xyz_gradient_accum.shape[0]],
+                            grace_iter=global_iter,
                         )
                         n_after = gaussians._xyz.shape[0]
+                        check_invariants(gaussians, tc, evlog, global_iter,
+                                         "densify")
                         monitor.update_densify(max(n_after - n_before, 0), n_after)
                         fraction_changed = abs(n_after - n_before) / max(n_after, 1)
                         monitor.reset(fraction_changed=fraction_changed)
@@ -1034,8 +1062,11 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     gaussians.opacity_size_prune(
                         min_opacity=0.005, max_screen_size=None,
                         extent=prog_scene.cameras_extent,
+                        grace_iter=global_iter,
                     )
                     n_after_fp = gaussians._xyz.shape[0]
+                    check_invariants(gaussians, tc, evlog, global_iter,
+                                     "fast_prune")
                     fraction_pruned = (n_before_fp - n_after_fp) / max(n_before_fp, 1)
                     monitor.reset(fraction_changed=fraction_pruned)
                     iters_since_fast_prune = 0
@@ -1052,6 +1083,8 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 ):
                     n_before_prune = gaussians._xyz.shape[0]
                     run_lightweight_prune(gaussians, prog_scene, opt, cfg, global_iter)
+                    check_invariants(gaussians, tc, evlog, global_iter,
+                                     "lightweight_prune")
                     n_at_last_prune = gaussians._xyz.shape[0]
                     fraction_pruned = (n_before_prune - n_at_last_prune) / max(n_before_prune, 1)
                     monitor.reset(fraction_changed=fraction_pruned)

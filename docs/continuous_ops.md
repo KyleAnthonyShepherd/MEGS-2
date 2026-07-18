@@ -38,6 +38,26 @@ Not persisted (rebuilt or accepted as loss): the in-flight ingest queue
 (the home-server retries, and the ledger dedups), `mask_blur`, and any
 partial iteration.
 
+## Always-on invariants
+
+`check_invariants` runs after every ingest and trigger firing; violations
+log an error and emit an `invariant_violation` event (never crash training):
+
+- **ceiling_exceeded** — splat count above `training.num_max_ceiling`;
+- **optimizer_binding** — Adam state keyed by a parameter object no longer
+  bound in any param group, i.e. momentum was silently discarded (the T1
+  bug pattern; `scene/optim_guard.py`).
+
+Two more invariants are structural rather than checked: all triggers in an
+iter receive the monitor state snapshotted at iter start (commit 6fbdf9a),
+and prunes respect grace protection — `run_lightweight_prune` masks
+grace-protected rows, and `opacity_size_prune` /
+`densify_and_prune_split` take `grace_iter` to do the same. Grace records
+are index ranges that previously went stale after any prune or mid-order
+densify append; `scene/index_remap.py` now remaps them (and fixes the
+`_sg_axis_count` / split-parent prune-mask end-append misalignment in the
+densify paths — see tests/test_index_remap.py).
+
 ## Regression harness
 
 GPU machine required. Replay a session and record metrics:
