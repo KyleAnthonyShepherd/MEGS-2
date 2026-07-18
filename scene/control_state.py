@@ -85,6 +85,26 @@ class ControlState:
             self._cond.notify_all()
         return request_id, False
 
+    def ledger_state(self) -> dict:
+        """Serializable idempotency ledger for checkpoint/resume, so a
+        retried ingest POST is still recognised after a process restart."""
+        with self._lock:
+            return {
+                "session_id": self.session_id,
+                "seen_images": [
+                    [sid, name, rid]
+                    for (sid, name), rid in self._seen_images.items()
+                ],
+            }
+
+    def restore_ledger(self, state: dict):
+        with self._cond:
+            self.session_id = state.get("session_id")
+            self._seen_images = {
+                (sid, name): rid
+                for sid, name, rid in state.get("seen_images", [])
+            }
+
     def drain_ingest_queue(self) -> list:
         with self._cond:
             items = list(self._ingest_queue)

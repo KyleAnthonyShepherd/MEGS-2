@@ -45,6 +45,7 @@ from scene.triggers import (
 )
 from scene.skipgs import SkipGSGate
 from scene.control_state import ControlState
+from scene.event_log import EventLog
 from spherical_gaussian_renderer import render_imp
 from utils.loss_utils import l1_loss, ssim
 from utils.graphics_utils import BasicPointCloud
@@ -128,6 +129,10 @@ class TrainingConfig:
     # rendered images via a per-image EMA of recent loss.
     image_error_weighting: bool = True
     image_error_ema_beta: float = 0.95
+    # Crash resilience: write train_state.pt (model + optimizer + monitor +
+    # ingest ledger) every N optimizer iters. 0 disables periodic saves
+    # (a save still happens at each converged-idle transition).
+    train_state_interval_iters: int = 500
 
 
 @dataclass
@@ -507,6 +512,37 @@ def write_snapshot_atomic(model_path: str, gaussians: SphericalGaussianModel,
 
 
 # ---------------------------------------------------------------------------
+# Train-state checkpoint (crash resilience / --resume)
+# ---------------------------------------------------------------------------
+
+TRAIN_STATE_NAME = "train_state.pt"
+
+
+def save_train_state(model_path: str, gaussians, monitor, skipgs, ctrl,
+                     trainer_state: dict) -> str:
+    """Atomically persist everything needed to continue a session after a
+    process restart: model tensors + Adam state (gaussians.capture()), grace
+    records, convergence-monitor state, SkipGS gate state, the ingest
+    idempotency ledger, and the trainer-loop counters."""
+    ckpt = {
+        "version": 1,
+        "model": gaussians.capture(),
+        "grace_records": [tuple(r) for r in getattr(gaussians, "_grace_records", [])],
+        "monitor": monitor.get_state(),
+        "skipgs": skipgs.get_state() if skipgs is not None else None,
+        "ledger": ctrl.ledger_state(),
+        "trainer": trainer_state,
+    }
+    out_dir = Path(model_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = out_dir / (TRAIN_STATE_NAME + ".tmp")
+    final = out_dir / TRAIN_STATE_NAME
+    torch.save(ckpt, str(tmp))
+    os.replace(str(tmp), str(final))
+    return str(final)
+
+
+# ---------------------------------------------------------------------------
 # Main continuous training loop
 # ---------------------------------------------------------------------------
 
@@ -565,6 +601,74 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
     bootstrapped = False
     warned_no_match_matrix = False
     export_dir = getattr(args, 'export_dir', None) or None
+
+    last_snapshot_dir = None
+    evlog = EventLog(os.path.join(model_path, "events.jsonl"))
+
+    def trainer_state_dict():
+        return {
+            "global_iter": global_iter,
+            "ema_loss": ema_loss,
+            "iters_since_densify": iters_since_densify,
+            "iters_since_fast_prune": iters_since_fast_prune,
+            "iters_since_lw_prune": iters_since_lw_prune,
+            "iters_since_cull": iters_since_cull,
+            "n_at_last_prune": n_at_last_prune,
+            "cycle_at_last_cull": cycle_at_last_cull,
+            "wrote_current_at_cycle": wrote_current_at_cycle,
+            "last_snapshot_dir": last_snapshot_dir,
+            "image_error_ema": dict(prog_scene.image_error_ema),
+            "image_weights": (
+                prog_scene.image_weights.tolist()
+                if prog_scene.image_weights is not None else None),
+        }
+
+    # ---- Resume from a previous run's train state ----
+    train_state_path = Path(model_path) / TRAIN_STATE_NAME
+    if getattr(args, "resume", False):
+        if train_state_path.exists():
+            ckpt = torch.load(str(train_state_path), weights_only=False)
+            ts = ckpt["trainer"]
+            last_snapshot_dir = ts.get("last_snapshot_dir")
+            if last_snapshot_dir and Path(last_snapshot_dir).exists():
+                # Cumulative snapshot: re-adding the latest one rebuilds the
+                # full camera set and sparse cloud.
+                prog_scene.add_snapshot(last_snapshot_dir)
+            else:
+                logger.warning(
+                    f"[resume] last snapshot dir missing ({last_snapshot_dir}); "
+                    "cameras will rebuild on the next ingest")
+            gaussians.restore(ckpt["model"], opt)
+            gaussians._grace_records = [
+                tuple(r) for r in ckpt.get("grace_records", [])]
+            monitor.set_state(ckpt["monitor"])
+            if skipgs is not None and ckpt.get("skipgs") is not None:
+                skipgs.set_state(ckpt["skipgs"])
+            ctrl.restore_ledger(ckpt.get("ledger", {}))
+            global_iter = ts["global_iter"]
+            ema_loss = ts["ema_loss"]
+            iters_since_densify = ts["iters_since_densify"]
+            iters_since_fast_prune = ts["iters_since_fast_prune"]
+            iters_since_lw_prune = ts["iters_since_lw_prune"]
+            iters_since_cull = ts["iters_since_cull"]
+            n_at_last_prune = ts["n_at_last_prune"]
+            cycle_at_last_cull = ts["cycle_at_last_cull"]
+            wrote_current_at_cycle = ts["wrote_current_at_cycle"]
+            prog_scene.image_error_ema = dict(ts.get("image_error_ema", {}))
+            if ts.get("image_weights") is not None:
+                prog_scene.image_weights = np.array(
+                    ts["image_weights"], dtype=np.float32)
+            evlog.emit("resume", iter=global_iter,
+                       n_images=prog_scene.n_images,
+                       splat_count=gaussians._xyz.shape[0])
+            logger.info(
+                f"[resume] restored iter={global_iter} "
+                f"N={gaussians._xyz.shape[0]} images={prog_scene.n_images} "
+                f"session={ctrl.session_id}")
+        else:
+            logger.warning(
+                f"[resume] requested but {train_state_path} not found; "
+                "starting fresh")
 
     _persistent_dav2 = None
     if cfg.dense_init.persist_model:
@@ -653,6 +757,14 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 skipgs._enabled = False
                 skipgs._steady_count = 0
 
+            last_snapshot_dir = req.snapshot_dir
+            evlog.emit("ingest", iter=global_iter,
+                       snapshot_dir=req.snapshot_dir,
+                       session_id=req.session_id,
+                       image_name=req.image_name,
+                       n_images=prog_scene.n_images,
+                       n_new_cams=len(new_cams),
+                       splat_count=gaussians._xyz.shape[0])
             ctrl.set_request_state(req.request_id, "training")
 
         # ---- 3. Bootstrap gate ----
@@ -701,6 +813,8 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     cycle_at_last_cull = monitor.cycle
                     iters_since_cull = 0
                     torch.cuda.empty_cache()
+                    evlog.emit("cull_sg_axes", iter=global_iter,
+                               state=cur_state, splat_count=n_unchanged)
                     logger.info(
                         f"[cull] SG axes pruned; Gaussian count unchanged at {n_unchanged}"
                     )
@@ -710,6 +824,11 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 path = write_snapshot_atomic(model_path, gaussians,
                                              export_dir, ctrl.session_id)
                 wrote_current_at_cycle = monitor.cycle
+                evlog.emit("converged", iter=global_iter,
+                           splat_count=gaussians._xyz.shape[0],
+                           n_images=prog_scene.n_images, snapshot=path)
+                save_train_state(model_path, gaussians, monitor, skipgs,
+                                 ctrl, trainer_state_dict())
                 logger.info(f"[converged] Wrote {path}; idling until next ingest or checkpoint")
             ctrl.update_status(
                 gaussian_count=gaussians._xyz.shape[0],
@@ -852,6 +971,8 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                         monitor.update_densify(max(n_after - n_before, 0), n_after)
                         fraction_changed = abs(n_after - n_before) / max(n_after, 1)
                         monitor.reset(fraction_changed=fraction_changed)
+                        evlog.emit("densify", iter=global_iter, state=cur_state,
+                                   n_before=n_before, n_after=n_after)
                         # mask_blur is reallocated at the top of the next iter
                         # when n_total changes; no need to reset here.
                         iters_since_densify = 0
@@ -872,6 +993,8 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     fraction_pruned = (n_before_fp - n_after_fp) / max(n_before_fp, 1)
                     monitor.reset(fraction_changed=fraction_pruned)
                     iters_since_fast_prune = 0
+                    evlog.emit("fast_prune", iter=global_iter, state=cur_state,
+                               n_before=n_before_fp, n_after=n_after_fp)
 
                 # ---- Lightweight importance prune ----
                 if should_lightweight_prune(
@@ -887,6 +1010,9 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     fraction_pruned = (n_before_prune - n_at_last_prune) / max(n_before_prune, 1)
                     monitor.reset(fraction_changed=fraction_pruned)
                     iters_since_lw_prune = 0
+                    evlog.emit("lightweight_prune", iter=global_iter,
+                               state=cur_state, n_before=n_before_prune,
+                               n_after=n_at_last_prune)
 
                 # SG axis cull is only handled in the converged-idle gate at
                 # the top of the loop — its require_state is ["converged"],
@@ -900,6 +1026,12 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
             iters_since_fast_prune += 1
             iters_since_lw_prune += 1
             iters_since_cull += 1
+
+            if (tc.train_state_interval_iters > 0
+                    and global_iter % tc.train_state_interval_iters == 0):
+                path = save_train_state(model_path, gaussians, monitor,
+                                        skipgs, ctrl, trainer_state_dict())
+                evlog.emit("train_state", iter=global_iter, path=path)
 
             if global_iter % 100 == 0:
                 logger.info(
@@ -928,6 +1060,10 @@ def main():
         default=os.environ.get("TRAINER_EXPORT_DIR", ""),
         help="Mirror snapshots to <export_dir>/<session_id>/latest.ply for the "
              "home-server viewer (defaults to $TRAINER_EXPORT_DIR)")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Restore model/optimizer/monitor/ledger from "
+             "<model_path>/train_state.pt and continue the session")
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()

@@ -171,6 +171,11 @@ training:
   # EMA decay on per-image base_loss. Higher = smoother, slower to react;
   # lower = more responsive but noisier. 0.95 → half-life of ~14 samples.
   image_error_ema_beta: 0.95
+  # Crash resilience: persist train_state.pt (model + Adam + monitor +
+  # ingest ledger) every N optimizer iters; restart with --resume to
+  # continue the session. 0 disables periodic saves (a save still happens
+  # at each converged-idle transition).
+  train_state_interval_iters: 500
 
 # ---------------------------------------------------------------------------
 # dense_init — per-image dense seeding via Depth-Anything-V2 on each ingest.

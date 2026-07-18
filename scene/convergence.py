@@ -17,6 +17,32 @@ class ConvergenceMonitor:
         # entire window — practically converged. Promoted in state().
         self._stalled_count = 0
 
+    def get_state(self) -> dict:
+        """Serializable state for checkpoint/resume."""
+        return {
+            "loss_window": self.loss_history.maxlen,
+            "densify_window": self.densify_history.maxlen,
+            "loss_history": list(self.loss_history),
+            "densify_history": [list(e) for e in self.densify_history],
+            "iter": self._iter,
+            "cycle": self.cycle,
+            "stalled_count": self._stalled_count,
+            "min_entries": getattr(self, "_min_entries", None),
+        }
+
+    def set_state(self, state: dict):
+        from collections import deque
+        self.loss_history = deque(state["loss_history"],
+                                  maxlen=state["loss_window"])
+        self.densify_history = deque(
+            (tuple(e) for e in state["densify_history"]),
+            maxlen=state["densify_window"])
+        self._iter = state["iter"]
+        self.cycle = state["cycle"]
+        self._stalled_count = state["stalled_count"]
+        if state.get("min_entries") is not None:
+            self._min_entries = state["min_entries"]
+
     def update_loss(self, ema_loss: float):
         self.loss_history.append(ema_loss)
         self._iter += 1
