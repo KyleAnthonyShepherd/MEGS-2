@@ -6,44 +6,14 @@ gaussians object. Validates the checkpoint file layout the --resume path
 reads, without needing a GPU.
 """
 
-import sys
-import types
 from pathlib import Path
 
-import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-
-@pytest.fixture(scope="module")
-def ct():
-    """Import continuous_train with CUDA-bound modules stubbed."""
-    sys.path.insert(0, str(REPO_ROOT))
-
-    def stub(name, **attrs):
-        if name in sys.modules:
-            return sys.modules[name]
-        m = types.ModuleType(name)
-        for k, v in attrs.items():
-            setattr(m, k, v)
-        sys.modules[name] = m
-        return m
-
-    stub("simple_knn")
-    stub("simple_knn._C", distCUDA2=lambda *a, **k: None)
-    stub("spherical_gaussian_renderer", render_imp=lambda *a, **k: {})
-    stub("fused_ssim", fused_ssim=lambda *a, **k: None)
-    # diff rasterizer pulled in transitively by the renderer package normally;
-    # stub defensively in case scene modules import it.
-    stub("diff_gaussian_rasterization_ms")
-
-    import importlib
-    try:
-        mod = importlib.import_module("continuous_train")
-    except Exception as e:
-        pytest.skip(f"continuous_train not importable in this env: {e}")
-    return mod
+# The `ct` fixture (continuous_train with CUDA deps stubbed) lives in
+# tests/conftest.py.
 
 
 class FakeGaussians:

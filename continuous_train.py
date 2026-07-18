@@ -34,9 +34,10 @@ from scene.spherical_gaussian_model import SphericalGaussianModel
 from scene.progressive_scene import ProgressiveScene
 from scene.match_matrix import parse_match_matrix, compute_image_weights
 from scene.dense_init import (
-    DepthAnythingV2Wrapper, align_depth_to_sfm, depth_to_points,
+    DepthAnythingV2Wrapper, DepthAnything3Wrapper, validate_alignment,
+    align_depth_to_sfm, depth_to_points,
     transform_to_camera_frame, AlignmentFailed,
-    DAv2Config, RansacConfig,
+    DAv2Config, DA3Config, RansacConfig,
 )
 from scene.convergence import ConvergenceMonitor
 from scene.triggers import (
@@ -138,6 +139,13 @@ class TrainingConfig:
 @dataclass
 class DenseInitConfig:
     enabled: bool = True
+    # dav2 | da3 — default stays dav2 until tools/bench_dense_init.py shows
+    # DA3 winning on quality at acceptable VRAM on the target machine.
+    backend: str = "dav2"
+    # When the DA3 fit fails its direct-depth sanity check for an image,
+    # retry just that image with DAv2 (contexts run sequentially, so the
+    # two models are never co-resident on GPU).
+    da3_fallback_to_dav2: bool = True
     min_sfm_points_for_alignment: int = 10
     min_sfm_depth_range_fraction: float = 0.10
     target_dense_points_per_image: int = 30_000
@@ -147,6 +155,7 @@ class DenseInitConfig:
     grace_iters: int = 20
     persist_model: bool = False
     dav2: DAv2Config = field(default_factory=DAv2Config)
+    da3: DA3Config = field(default_factory=DA3Config)
     ransac: RansacConfig = field(default_factory=RansacConfig)
 
 
@@ -204,6 +213,8 @@ def load_config(yaml_path: str) -> ContinuousConfig:
         for k, v in di.items():
             if k == "dav2":
                 _apply_dict(cfg.dense_init.dav2, v)
+            elif k == "da3":
+                _apply_dict(cfg.dense_init.da3, v)
             elif k == "ransac":
                 _apply_dict(cfg.dense_init.ransac, v)
             elif hasattr(cfg.dense_init, k):
@@ -341,9 +352,14 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
     accumulated_xyz = []
     accumulated_rgb = []
     scene_scale = prog_scene.cameras_extent
+    backend = getattr(dense_cfg, 'backend', 'dav2')
+    # Cameras whose DA3 fit failed the direct-depth sanity check; retried
+    # with DAv2 after the DA3 context closes (never co-resident on GPU).
+    fallback_cams = []
 
-    def _run_cameras(depth_model):
-        for cam in new_cams:
+    def _run_cameras(depth_model, cams, model_backend):
+        pass_camera = getattr(depth_model, 'accepts_camera', False)
+        for cam in cams:
             sfm_xyz_all, visible_mask = prog_scene.get_sfm_points_visible_to(cam)
             sfm_xyz_visible = sfm_xyz_all[visible_mask]
 
@@ -355,7 +371,10 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
             if depth_range < dense_cfg.min_sfm_depth_range_fraction * scene_scale:
                 continue
 
-            depth_map = depth_model.predict(cam.original_image.cpu())
+            if pass_camera:
+                depth_map = depth_model.predict(cam.original_image.cpu(), camera=cam)
+            else:
+                depth_map = depth_model.predict(cam.original_image.cpu())
 
             try:
                 result = align_depth_to_sfm(
@@ -364,6 +383,13 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
                 )
             except AlignmentFailed as e:
                 logger.warning(f"[dense-init] alignment failed for {cam.image_name}: {e}")
+                del depth_map
+                continue
+
+            ok, reason = validate_alignment(model_backend, result)
+            if not ok:
+                logger.warning(f"[dense-init] {cam.image_name}: {reason}")
+                fallback_cams.append(cam)
                 del depth_map
                 continue
 
@@ -388,11 +414,26 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
                 f"(a={result.a:.3f}, b={result.b:.3f}, inliers={result.n_inliers})"
             )
 
-    if dav2_model is not None:
-        _run_cameras(dav2_model)
+    if backend == "da3":
+        if dav2_model is not None:
+            logger.warning(
+                "[dense-init] persist_model is only supported for the dav2 "
+                "backend; ignoring persistent handle for da3")
+        with DepthAnything3Wrapper(dense_cfg.da3) as depth_model:
+            _run_cameras(depth_model, new_cams, "da3")
+        if fallback_cams and getattr(dense_cfg, 'da3_fallback_to_dav2', True):
+            logger.warning(
+                f"[dense-init] retrying {len(fallback_cams)} image(s) with "
+                "DAv2 after DA3 sanity failure")
+            retry = list(fallback_cams)
+            fallback_cams.clear()
+            with DepthAnythingV2Wrapper(dense_cfg.dav2) as depth_model:
+                _run_cameras(depth_model, retry, "dav2")
+    elif dav2_model is not None:
+        _run_cameras(dav2_model, new_cams, "dav2")
     else:
         with DepthAnythingV2Wrapper(dense_cfg.dav2) as depth_model:
-            _run_cameras(depth_model)
+            _run_cameras(depth_model, new_cams, "dav2")
 
     if not accumulated_xyz:
         return
@@ -672,7 +713,12 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
 
     _persistent_dav2 = None
     if cfg.dense_init.persist_model:
-        _persistent_dav2 = DepthAnythingV2Wrapper(cfg.dense_init.dav2).__enter__()
+        if cfg.dense_init.backend == "da3":
+            logger.warning(
+                "[dense-init] persist_model not supported with backend=da3; "
+                "DA3 loads per ingest")
+        else:
+            _persistent_dav2 = DepthAnythingV2Wrapper(cfg.dense_init.dav2).__enter__()
 
     logger.info("[continuous] Trainer started; waiting for ≥4 images via /ingest")
 

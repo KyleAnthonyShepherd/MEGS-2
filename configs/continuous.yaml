@@ -183,6 +183,27 @@ training:
 dense_init:
   enabled: true
 
+  # Monocular-depth backend: dav2 | da3. Default stays dav2 until
+  # tools/bench_dense_init.py shows DA3 winning on quality at acceptable
+  # VRAM on the 6 GB target (commit the results table with the flip).
+  backend: dav2
+
+  # DA3 predicts depth directly; when its RANSAC fit comes out with a <= 0
+  # for an image, retry just that image with DAv2 (models load sequentially,
+  # never co-resident on GPU).
+  da3_fallback_to_dav2: true
+
+  # Depth Anything 3 settings (used when backend: da3).
+  da3:
+    # HF repo id. DA3-SMALL is the 6 GB-safe start; DA3-BASE next;
+    # DA3MONO-LARGE / DA3METRIC-LARGE only after checking headroom.
+    model_name: "depth-anything/DA3-SMALL"
+    device: "cuda"
+    process_res: 504
+    # Pass COLMAP pose/intrinsics as conditioning (pose-conditioned depth).
+    conditioning: true
+    use_ray_pose: false
+
   # Skip dense-init if the new image has fewer than this many SfM points
   # available for monocular-depth-to-SfM alignment.
   min_sfm_points_for_alignment: 10
