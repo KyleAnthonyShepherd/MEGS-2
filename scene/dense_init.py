@@ -59,10 +59,15 @@ class DA3Config:
     model_name: str = "depth-anything/DA3-SMALL"
     device: str = "cuda"
     process_res: int = 504
-    # Pass the session's COLMAP pose/intrinsics as conditioning. Single-image
-    # calls mostly benefit from the intrinsics (FOV prior); extrinsics matter
-    # once multi-image batches are used.
+    # Pass the session's COLMAP intrinsics as conditioning (FOV prior).
     conditioning: bool = True
+    # Additionally pass COLMAP extrinsics. DA3 aligns its predicted pose
+    # trajectory to the input poses with Umeyama Sim(3), which needs >= 2
+    # views — a single-image call is rank-degenerate and raises
+    # GeometryException. predict() runs one image at a time and only consumes
+    # prediction.depth (RANSAC re-fits scale to SfM), so extrinsics add nothing
+    # in that path; keep this OFF until a multi-view batch path exists.
+    condition_extrinsics: bool = False
     use_ray_pose: bool = False
 
 
@@ -242,8 +247,11 @@ class DepthAnything3Wrapper:
         kwargs = {}
         if camera is not None and self.cfg.conditioning:
             ext, ixt = camera_to_da3_conditioning(camera)
-            kwargs["extrinsics"] = ext
             kwargs["intrinsics"] = ixt
+            # Extrinsics only when explicitly enabled (multi-view path); a
+            # single-image call makes DA3's Umeyama pose alignment degenerate.
+            if self.cfg.condition_extrinsics:
+                kwargs["extrinsics"] = ext
         if self.cfg.use_ray_pose:
             kwargs["use_ray_pose"] = True
 

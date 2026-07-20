@@ -97,10 +97,15 @@ So `latest.ply` reflects the newly added camera within a second of the
 - `bootstrap.min_images` is **3**, kept equal to the home-server's mapper gate
   (`SFM_MIN_IMAGES_TO_MAP`, default 3). The trainer idles `initializing` until
   `/ingest` brings the registered-image count to this.
-- `dense_init.backend` is **da3** (Depth Anything V3), pose-conditioned: the
-  COLMAP extrinsics+intrinsics of each new camera are fed to DA3 as
-  conditioning. Per-image DA3 failures fall back to DAv2
-  (`da3_fallback_to_dav2`, models load sequentially — never co-resident).
+- `dense_init.backend` is **da3** (Depth Anything V3). Each image's depth is
+  conditioned on the COLMAP **intrinsics** (FOV prior). Extrinsics are *not*
+  passed: DA3 aligns its predicted pose trajectory to the input poses with
+  Umeyama Sim(3), which is rank-degenerate for the single-image calls we make
+  (crashes with `GeometryException`); we only consume `prediction.depth` and
+  RANSAC-refit scale to SfM, so extrinsics add nothing. `condition_extrinsics`
+  (default off) gates them for a future multi-view batch path.
+  `da3_fallback_to_dav2` is off — a bad DA3 fit skips that image's dense-init
+  (SfM points still seed it) rather than switching models.
 
 ## Match matrix (optional, removes the L8 uniform-weight fallback)
 

@@ -51,8 +51,9 @@ VRAM freed, **no disk writes**) before each image's COLMAP work, then RESUMES
   After each ingest's dense-init it writes an **early snapshot** so the
   viewer's `latest.ply` reflects the new camera before training.
 - **Config:** `bootstrap.min_images: 3` (matches `SFM_MIN_IMAGES_TO_MAP`),
-  `dense_init.backend: da3` (pose-conditioned, DAv2 fallback),
-  `http.pause_timeout: 30`.
+  `dense_init.backend: da3` (intrinsics-conditioned; extrinsics off — DA3's
+  Umeyama pose alignment is degenerate for single-image calls; DAv2 fallback
+  off), `http.pause_timeout: 30`.
 
 ## Codebase Reconnaissance (Phase 1 answers)
 

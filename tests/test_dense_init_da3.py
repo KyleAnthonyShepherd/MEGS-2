@@ -49,6 +49,9 @@ def test_da3_config_defaults():
     cfg = _di.DA3Config()
     assert cfg.model_name == "depth-anything/DA3-SMALL"
     assert cfg.conditioning is True
+    # Extrinsics conditioning is off by default: single-image inference makes
+    # DA3's Umeyama pose alignment rank-degenerate.
+    assert cfg.condition_extrinsics is False
     assert cfg.process_res == 504
 
 
@@ -328,3 +331,49 @@ def test_dav2_backend_unchanged(ct, monkeypatch):
     assert not da3_used
     assert dav2_model.calls == [None]
     assert gaussians.expanded
+
+
+# ---------------------------------------------------------------------------
+# Single-image conditioning: intrinsics only, no extrinsics
+# ---------------------------------------------------------------------------
+
+class _RecordingDA3Model:
+    """Captures the kwargs DepthAnything3Wrapper.predict forwards to DA3's
+    inference(), so we can assert extrinsics are withheld for single-image
+    calls (which would make DA3's Umeyama pose alignment degenerate)."""
+
+    def __init__(self):
+        self.last_kwargs = None
+
+    def inference(self, images, **kwargs):
+        self.last_kwargs = kwargs
+
+        class _Pred:
+            depth = [np.zeros((4, 4), dtype=np.float32)]
+        return _Pred()
+
+
+def _predict_once(cfg):
+    w = _di.DepthAnything3Wrapper(cfg)
+    w.model = _RecordingDA3Model()
+    cam = FakeCamera(W=8, H=8)
+    img = torch.zeros((3, 8, 8))
+    w.predict(img, camera=cam)
+    return w.model.last_kwargs
+
+
+def test_da3_predict_conditions_on_intrinsics_only_by_default():
+    kwargs = _predict_once(_di.DA3Config(conditioning=True))
+    assert "intrinsics" in kwargs           # FOV prior is passed
+    assert "extrinsics" not in kwargs        # withheld: single-view degeneracy
+
+
+def test_da3_predict_passes_extrinsics_when_enabled():
+    kwargs = _predict_once(
+        _di.DA3Config(conditioning=True, condition_extrinsics=True))
+    assert "intrinsics" in kwargs and "extrinsics" in kwargs
+
+
+def test_da3_predict_no_conditioning_passes_neither():
+    kwargs = _predict_once(_di.DA3Config(conditioning=False))
+    assert "intrinsics" not in kwargs and "extrinsics" not in kwargs
