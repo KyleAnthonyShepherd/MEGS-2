@@ -362,6 +362,16 @@ class SphericalGaussianModel:
         cohort_lr_scales = model_args["cohort_lr_scale"]
         n_cohorts = len(model_args["xyz_cohorts"])
 
+        # A train_state.pt written while the trainer was paused (home-server
+        # pause/resume) holds CPU tensors; loaded on a fresh --resume with a
+        # free GPU, normalise every restored tensor back to CUDA so the
+        # optimizer state (cast to param device by load_state_dict) lands on
+        # CUDA too. Tensors saved on GPU are already there — .to() is a no-op.
+        _dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+        def _r(t):
+            return t.to(_dev)
+
         self._xyz_cohorts = []
         self._rgb_base_cohorts = []
         self._opacity_cohorts = []
@@ -375,15 +385,15 @@ class SphericalGaussianModel:
         self.cohort_xyz_scheduler = []
 
         for ci in range(n_cohorts):
-            self._xyz_cohorts.append(nn.Parameter(model_args["xyz_cohorts"][ci].requires_grad_(True)))
-            self._rgb_base_cohorts.append(nn.Parameter(model_args["rgb_base_cohorts"][ci].requires_grad_(True)))
-            self._opacity_cohorts.append(nn.Parameter(model_args["opacity_cohorts"][ci].requires_grad_(True)))
-            self._scaling_cohorts.append(nn.Parameter(model_args["scaling_cohorts"][ci].requires_grad_(True)))
-            self._rotation_cohorts.append(nn.Parameter(model_args["rotation_cohorts"][ci].requires_grad_(True)))
+            self._xyz_cohorts.append(nn.Parameter(_r(model_args["xyz_cohorts"][ci]).requires_grad_(True)))
+            self._rgb_base_cohorts.append(nn.Parameter(_r(model_args["rgb_base_cohorts"][ci]).requires_grad_(True)))
+            self._opacity_cohorts.append(nn.Parameter(_r(model_args["opacity_cohorts"][ci]).requires_grad_(True)))
+            self._scaling_cohorts.append(nn.Parameter(_r(model_args["scaling_cohorts"][ci]).requires_grad_(True)))
+            self._rotation_cohorts.append(nn.Parameter(_r(model_args["rotation_cohorts"][ci]).requires_grad_(True)))
             if self.max_sg_degree > 0:
-                self._sg_directions_cohorts.append(nn.Parameter(model_args["sg_directions_cohorts"][ci].requires_grad_(True)))
-                self._sg_sharpness_cohorts.append(nn.Parameter(model_args["sg_sharpness_cohorts"][ci].requires_grad_(True)))
-                self._sg_rgb_cohorts.append(nn.Parameter(model_args["sg_rgb_cohorts"][ci].requires_grad_(True)))
+                self._sg_directions_cohorts.append(nn.Parameter(_r(model_args["sg_directions_cohorts"][ci]).requires_grad_(True)))
+                self._sg_sharpness_cohorts.append(nn.Parameter(_r(model_args["sg_sharpness_cohorts"][ci]).requires_grad_(True)))
+                self._sg_rgb_cohorts.append(nn.Parameter(_r(model_args["sg_rgb_cohorts"][ci]).requires_grad_(True)))
             else:
                 n = model_args["xyz_cohorts"][ci].shape[0]
                 self._sg_directions_cohorts.append(nn.Parameter(torch.empty((n, 0, 3), device="cuda").requires_grad_(True)))
@@ -398,14 +408,86 @@ class SphericalGaussianModel:
                 max_steps=training_args.position_lr_max_steps,
             ))
 
-        self._sg_axis_count = model_args["sg_axis_count"]
-        self.max_radii2D = model_args["max_radii2D"]
-        self.xyz_gradient_accum = model_args["xyz_gradient_accum"]
-        self.denom = model_args["denom"]
+        self._sg_axis_count = _r(model_args["sg_axis_count"])
+        self.max_radii2D = _r(model_args["max_radii2D"])
+        self.xyz_gradient_accum = _r(model_args["xyz_gradient_accum"])
+        self.denom = _r(model_args["denom"])
         self.spatial_lr_scale = model_args["spatial_lr_scale"]
 
         self.training_setup(training_args)
         self.optimizer.load_state_dict(model_args["optimizer"])
+
+    # ------------------------------------------------------------------
+    # GPU serialization (home-server pause/resume — MEGS-2 ingest contract §2/§3)
+    # ------------------------------------------------------------------
+
+    def _all_cohort_lists(self):
+        return (
+            self._xyz_cohorts, self._rgb_base_cohorts, self._opacity_cohorts,
+            self._scaling_cohorts, self._rotation_cohorts,
+            self._sg_directions_cohorts, self._sg_sharpness_cohorts,
+            self._sg_rgb_cohorts,
+        )
+
+    def _move_all(self, device):
+        """Move every GPU-resident tensor to ``device`` IN PLACE.
+
+        Covers every cohort ``nn.Parameter`` (xyz/rgb_base/opacity/scaling/
+        rotation/sg_directions/sg_sharpness/sg_rgb), the non-Adam buffers
+        (``max_radii2D``, ``xyz_gradient_accum``, ``denom``,
+        ``_sg_axis_count``) and the Adam optimizer momentum state
+        (``exp_avg``, ``exp_avg_sq``, and ``max_exp_avg_sq`` under amsgrad) for
+        each param. The Adam ``step`` counter is left where Adam created it
+        (CPU for the default non-capturable Adam) so the resumed state keeps a
+        standard layout.
+
+        Parameter objects are *mutated* (``p.data = ...``), never replaced, so
+        the optimizer's state stays keyed to the same params —
+        ``optim_guard.optimizer_binding_ok()`` continues to hold after a
+        round trip (the T1 momentum-loss invariant). Device→device float
+        transfer is bit-exact, so a to_cpu()→to_cuda() round trip is a no-op
+        on values.
+        """
+        device = torch.device(device)
+        # Single GPU: compare device *type* so an already-on-cuda tensor
+        # (cuda:0) isn't seen as different from the index-less torch.device("cuda").
+        dtype = device.type
+        # Any cached cohort-cat views (stable_views) are device-stale; drop them.
+        self._iter_views = None
+
+        for cohorts in self._all_cohort_lists():
+            for p in cohorts:
+                if p.data.device.type != dtype:
+                    p.data = p.data.to(device)
+                if p.grad is not None and p.grad.device.type != dtype:
+                    p.grad = p.grad.to(device)
+
+        for name in ("_sg_axis_count", "max_radii2D", "xyz_gradient_accum", "denom"):
+            t = getattr(self, name)
+            if torch.is_tensor(t) and t.device.type != dtype:
+                setattr(self, name, t.to(device))
+
+        if self.optimizer is not None:
+            for state in self.optimizer.state.values():
+                for k, v in state.items():
+                    if k == "step":
+                        continue  # scalar counter; Adam keeps it on CPU
+                    if torch.is_tensor(v) and v.device.type != dtype:
+                        state[k] = v.to(device)
+
+    def to_cpu(self):
+        """Move model + Adam state to CPU RAM and free VRAM. No disk writes.
+
+        Idempotent: a second call while already on CPU is a cheap no-op. The
+        caller (trainer loop) follows this with empty_cache()/synchronize()."""
+        self._move_all("cpu")
+
+    def to_cuda(self):
+        """Move model + Adam state back to GPU and rebind for training.
+
+        Inverse of :meth:`to_cpu`; the optimizer binding is preserved so
+        training resumes from the exact paused state. Idempotent."""
+        self._move_all("cuda")
 
     # ------------------------------------------------------------------
     # Cohort creation

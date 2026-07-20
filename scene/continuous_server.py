@@ -14,9 +14,17 @@ Endpoints:
                            200 no-op reporting the original request_id.
                         2. Legacy: {"snapshot_dir": "...", "request_id": "..."}
                         → 202 {"request_id": "..."} (200 on duplicate)
+    POST /pause         → 200 {"paused": true, "vram_mb": <post-move MiB>}
+                        Blocks (up to pause_timeout) until the trainer has
+                        moved its model to CPU and freed VRAM. Idempotent: a
+                        second /pause while already paused is a fast no-op
+                        reporting the current vram_mb.
+    POST /resume        → 200 {"paused": false}
+                        Moves the model back to GPU; training continues from
+                        the exact paused state. Idempotent.
     POST /checkpoint    → 200 {"path": "..."}  (blocks until write completes)
     GET  /health        → 200 {"state","iter","splat_count","queue_depth",
-                                "last_ingest","vram_mb", ...}
+                                "last_ingest","vram_mb","paused", ...}
     GET  /status        → 200 {"gaussian_count":N, "monitor_state":"...", ...}
     GET  /status/{id}   → 200 {"state": "queued|integrating|training|converged|unknown"}
 """
@@ -60,9 +68,10 @@ def resolve_snapshot_dir(body: dict) -> Tuple[Optional[str], Optional[str]]:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    # ctrl and checkpoint_timeout are injected by the factory below
+    # ctrl, checkpoint_timeout and pause_timeout are injected by the factory
     ctrl = None
     checkpoint_timeout: float = 30.0
+    pause_timeout: float = 30.0
 
     def log_message(self, fmt, *args):
         pass  # suppress default stderr logging
@@ -120,6 +129,30 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json(202, {"request_id": rid})
 
+        elif self.path == "/pause":
+            # Idempotent: if already paused, report the current VRAM without
+            # disturbing the (parked) trainer loop — the server re-pauses each
+            # job in a backlog.
+            if self.ctrl.is_paused():
+                self._send_json(200, {
+                    "paused": True, "vram_mb": self.ctrl.current_vram_mb()})
+                return
+            self.ctrl.request_pause()
+            ok = self.ctrl.wait_until_paused(timeout=self.pause_timeout)
+            if ok:
+                self._send_json(200, {
+                    "paused": True, "vram_mb": self.ctrl.current_vram_mb()})
+            else:
+                # Trainer didn't ack in time (e.g. mid-ingest on a huge scene).
+                # Report not-paused so the caller can decide; it proceeds with
+                # COLMAP regardless per the home-server's degrade-to-no-op rule.
+                self._send_json(504, {"error": "pause timed out", "paused": False})
+
+        elif self.path == "/resume":
+            self.ctrl.request_resume()
+            self.ctrl.wait_until_resumed(timeout=self.pause_timeout)
+            self._send_json(200, {"paused": False})
+
         elif self.path == "/checkpoint":
             self.ctrl.request_checkpoint()
             path = self.ctrl.wait_for_checkpoint(timeout=self.checkpoint_timeout)
@@ -147,13 +180,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
 
-def start_server(host: str, port: int, ctrl, checkpoint_timeout: float = 30.0):
+def start_server(host: str, port: int, ctrl, checkpoint_timeout: float = 30.0,
+                 pause_timeout: float = 30.0):
     """Spin up ThreadingHTTPServer in a daemon thread; returns immediately."""
 
     # Build a handler class with the shared state baked in
     handler = type("Handler", (_Handler,), {
         "ctrl": ctrl,
         "checkpoint_timeout": checkpoint_timeout,
+        "pause_timeout": pause_timeout,
     })
 
     server = ThreadingHTTPServer((host, port), handler)

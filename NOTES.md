@@ -12,6 +12,7 @@ first thing to re-read.
 | L8 — match-matrix files may not exist | uniform-fallback branch logs one WARNING (`continuous_train.py`); home-server now exports the files (`docs/ingest_contract.md`); format round-trip in `tests/test_match_matrix.py::test_parse_home_server_format` |
 | DL2 — DAv2 outputs disparity, DA3 outputs depth | `tests/test_dense_init_da3.py::test_validate_alignment_*` (sign gate per backend) |
 | T1 — Adam state lost on rebind after prune | `tests/test_optim_guard.py` (+ always-on `check_invariants`) |
+| T1 (pause/resume) — Adam state must survive a to_cpu()→to_cuda() round trip | `tests/test_pause_resume.py::test_model_to_cpu_to_cuda_round_trip` (binding + bitwise equality + loss keeps falling; GPU-gated) |
 | Grace ranges stale after prune / mid-order densify append | `tests/test_index_remap.py` (incl. simulated historical misalignment) |
 | `_sg_axis_count` / split prune-mask end-append misalignment | `tests/test_index_remap.py::test_simulated_axis_count_stays_aligned_through_clone_and_prune`, `::test_perm_gathers_endcat_into_final_order` |
 | Scheduler bugs: densify_saturation never aging out; stalled grinding forever | `tests/test_convergence.py::test_densify_saturation_ages_out_by_iter`, `::test_plateau_reads_stalled_then_promotes_to_converged` |
@@ -20,6 +21,38 @@ first thing to re-read.
 | SkipGS budget floor / warmup lifecycle | `tests/test_skipgs.py` |
 | Ingest retries must be no-ops (incl. across restarts) | `tests/test_continuous_server.py::test_ingest_duplicate_is_200_noop`, `tests/test_train_state.py::test_ledger_round_trip_preserves_idempotency` |
 | Gravity/camera-convention math (DL1/DL3) | `tests/test_dense_init.py` geometry tests; conditioning matrices in `tests/test_dense_init_da3.py::test_conditioning_matrices` |
+
+## Phase 3: GPU serialization (home-server pause/resume)
+
+The home-server owns the trainer as a subprocess and drives a strictly
+serialized single-GPU cycle: it PAUSES the trainer (model + Adam → CPU RAM,
+VRAM freed, **no disk writes**) before each image's COLMAP work, then RESUMES
++ ingests. The trainer side of that contract
+(`docs/ingest_contract.md`, the MEGS2 integration contract):
+
+- **`SphericalGaussianModel.to_cpu()` / `to_cuda()`** move every cohort
+  `nn.Parameter`, the buffers (`max_radii2D`, `xyz_gradient_accum`, `denom`,
+  `_sg_axis_count`) and the Adam state (`exp_avg`/`exp_avg_sq`) **in place**.
+  Params are mutated (`p.data = ...`), never replaced, so `optimizer.state`
+  stays keyed to the same objects and `optimizer_binding_ok()` holds across
+  the round trip (T1). Device→device float copy is bit-exact.
+- **`ControlState`** carries the pause/resume handshake
+  (`request_pause`/`mark_paused`/`wait_for_resume`/`mark_resumed`);
+  `wait_for_work` also wakes on a pause request so an idle/converged trainer
+  releases the GPU promptly. `paused` is added to `/health` and `/status`.
+- **`continuous_server`** exposes `POST /pause` (blocks for the CPU-move ack,
+  returns `{"paused": true, "vram_mb": ...}`, idempotent, 504 on timeout) and
+  `POST /resume` (`{"paused": false}`, idempotent).
+- **`continuous_train` loop:** checks `ctrl.pause_requested()` at the top
+  (a safe point between optimizer steps), runs the pause dance (to_cpu →
+  empty_cache/synchronize → ack → park until resume → to_cuda), then
+  continues. SIGINT now writes a final `train_state.pt` (bringing the model
+  back to GPU first if paused; `restore()` also tolerates a CPU-saved state).
+  After each ingest's dense-init it writes an **early snapshot** so the
+  viewer's `latest.ply` reflects the new camera before training.
+- **Config:** `bootstrap.min_images: 3` (matches `SFM_MIN_IMAGES_TO_MAP`),
+  `dense_init.backend: da3` (pose-conditioned, DAv2 fallback),
+  `http.pause_timeout: 30`.
 
 ## Codebase Reconnaissance (Phase 1 answers)
 
