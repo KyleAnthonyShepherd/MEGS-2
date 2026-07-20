@@ -186,16 +186,14 @@ dense_init:
   enabled: true
 
   # Monocular-depth backend: dav2 | da3. DA3 is the default on the 6 GB
-  # target: DA3-SMALL fits, and it accepts the COLMAP pose+intrinsics as
-  # conditioning (pose-conditioned depth) which dav2 cannot. Per-image DA3
-  # failures fall back to dav2 (da3_fallback_to_dav2). Set back to dav2 to
-  # disable pose-conditioned depth.
+  # target: DA3-SMALL fits, and it conditions depth on the COLMAP intrinsics
+  # (FOV prior) which dav2 cannot. Set back to dav2 to use disparity depth.
   backend: da3
 
-  # DA3 predicts depth directly; when its RANSAC fit comes out with a <= 0
-  # for an image, retry just that image with DAv2 (models load sequentially,
-  # never co-resident on GPU).
-  da3_fallback_to_dav2: true
+  # Run DA3 only (no DAv2 fallback). When DA3's RANSAC fit is bad (a <= 0)
+  # for an image, skip that image's dense-init rather than retrying it with
+  # DAv2 — SfM points still seed it. Flip to true to re-enable the fallback.
+  da3_fallback_to_dav2: false
 
   # Depth Anything 3 settings (used when backend: da3).
   da3:
@@ -204,8 +202,12 @@ dense_init:
     model_name: "depth-anything/DA3-SMALL"
     device: "cuda"
     process_res: 504
-    # Pass COLMAP pose/intrinsics as conditioning (pose-conditioned depth).
+    # Condition depth on the COLMAP intrinsics (FOV prior).
     conditioning: true
+    # Also condition on extrinsics. OFF: we run DA3 one image at a time and
+    # its pose alignment (Umeyama Sim(3)) is rank-degenerate for a single
+    # view. Only enable alongside a multi-view batch path.
+    condition_extrinsics: false
     use_ray_pose: false
 
   # Skip dense-init if the new image has fewer than this many SfM points
