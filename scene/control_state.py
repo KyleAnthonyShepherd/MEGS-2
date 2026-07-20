@@ -41,6 +41,16 @@ class ControlState:
         self._checkpoint_done: bool = False
         self._last_snapshot_path: Optional[str] = None
 
+        # GPU-serialization handshake (home-server pause/resume). The HTTP
+        # thread requests a pause; the trainer loop moves its model to CPU at
+        # a safe point, marks itself paused, parks until resume is requested,
+        # then moves back to GPU. `_vram_mb_paused` is the post-move VRAM the
+        # /pause reply reports.
+        self._pause_requested: bool = False
+        self._resume_requested: bool = False
+        self._paused: bool = False
+        self._vram_mb_paused: Optional[float] = None
+
         # Status mirror updated by the trainer each iteration
         self.gaussian_count: int = 0
         self.monitor_state: str = "initializing"
@@ -151,14 +161,83 @@ class ControlState:
             return None
 
     # ------------------------------------------------------------------
+    # GPU-serialization handshake (pause / resume)
+    # ------------------------------------------------------------------
+
+    def request_pause(self):
+        """HTTP thread: ask the trainer loop to move its model to CPU."""
+        with self._cond:
+            self._pause_requested = True
+            self._resume_requested = False
+            self._cond.notify_all()
+
+    def request_resume(self):
+        """HTTP thread: ask the trainer loop to move its model back to GPU."""
+        with self._cond:
+            self._resume_requested = True
+            self._pause_requested = False
+            self._cond.notify_all()
+
+    def pause_requested(self) -> bool:
+        """Trainer loop: a pause is pending and we're not already paused."""
+        with self._lock:
+            return self._pause_requested and not self._paused
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def current_vram_mb(self) -> Optional[float]:
+        with self._lock:
+            return self._vram_mb_paused
+
+    def mark_paused(self, vram_mb: Optional[float]):
+        """Trainer loop: the model is now on CPU; VRAM freed. Wakes /pause."""
+        with self._cond:
+            self._paused = True
+            self._pause_requested = False
+            self._vram_mb_paused = vram_mb
+            self._cond.notify_all()
+
+    def wait_until_paused(self, timeout: float = 30.0) -> bool:
+        """HTTP /pause: block until the trainer acks the model is on CPU."""
+        with self._cond:
+            self._cond.wait_for(lambda: self._paused, timeout=timeout)
+            return self._paused
+
+    def wait_for_resume(self, timeout: float = 1.0) -> bool:
+        """Trainer loop (while paused): block until resume is requested.
+
+        Polled with a finite timeout so a SIGINT still lands promptly on the
+        main thread. Returns True once resume has been requested."""
+        with self._cond:
+            self._cond.wait_for(lambda: self._resume_requested, timeout=timeout)
+            return self._resume_requested
+
+    def mark_resumed(self):
+        """Trainer loop: the model is back on GPU. Wakes /resume."""
+        with self._cond:
+            self._paused = False
+            self._resume_requested = False
+            self._vram_mb_paused = None
+            self._cond.notify_all()
+
+    def wait_until_resumed(self, timeout: float = 30.0) -> bool:
+        """HTTP /resume: block until the trainer has left the paused state."""
+        with self._cond:
+            self._cond.wait_for(lambda: not self._paused, timeout=timeout)
+            return not self._paused
+
+    # ------------------------------------------------------------------
     # Idle / wake
     # ------------------------------------------------------------------
 
     def wait_for_work(self, timeout: float = 1.0):
-        """Block until ingest arrives or checkpoint is requested."""
+        """Block until ingest arrives, checkpoint, or a pause is requested."""
         with self._cond:
             self._cond.wait_for(
-                lambda: bool(self._ingest_queue) or self._checkpoint_requested,
+                lambda: (bool(self._ingest_queue) or self._checkpoint_requested
+                         or self._pause_requested),
                 timeout=timeout,
             )
 
@@ -190,11 +269,13 @@ class ControlState:
                 "session_id": self.session_id,
                 "iter": self.iter,
                 "last_ingest": self.last_ingest,
+                "paused": self._paused,
             }
 
     def health_snapshot(self) -> dict:
         """Health payload per the home-server contract (app/api/trainer.py):
-        keys state, iter, splat_count, queue_depth, last_ingest, vram_mb."""
+        keys state, iter, splat_count, queue_depth, last_ingest, vram_mb,
+        session_id, n_images, bootstrap_complete, paused."""
         with self._lock:
             return {
                 "state": self.monitor_state,
@@ -206,6 +287,7 @@ class ControlState:
                 "session_id": self.session_id,
                 "n_images": self.n_images,
                 "bootstrap_complete": self.bootstrap_complete,
+                "paused": self._paused,
             }
 
 

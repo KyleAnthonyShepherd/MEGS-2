@@ -140,8 +140,8 @@ class TrainingConfig:
 @dataclass
 class DenseInitConfig:
     enabled: bool = True
-    # dav2 | da3 — default stays dav2 until tools/bench_dense_init.py shows
-    # DA3 winning on quality at acceptable VRAM on the target machine.
+    # dav2 | da3. Dataclass fallback is dav2; configs/continuous.yaml selects
+    # da3 (pose-conditioned depth) as the operative default on the 6 GB target.
     backend: str = "dav2"
     # When the DA3 fit fails its direct-depth sanity check for an image,
     # retry just that image with DAv2 (contexts run sequentially, so the
@@ -165,6 +165,9 @@ class HttpConfig:
     host: str = "127.0.0.1"
     port: int = 8666
     checkpoint_timeout: float = 30.0
+    # Max seconds a POST /pause blocks waiting for the trainer to move its
+    # model to CPU and ack. Matches the home-server's 30 s pause block.
+    pause_timeout: float = 30.0
 
 
 @dataclass
@@ -545,6 +548,21 @@ def check_invariants(gaussians, tc, evlog, global_iter, where):
 
 
 # ---------------------------------------------------------------------------
+# GPU-serialization helpers (home-server pause/resume)
+# ---------------------------------------------------------------------------
+
+def _cuda_memory_mb() -> Optional[float]:
+    """Currently-allocated VRAM in MiB, or None without CUDA. Reported to the
+    home-server in the /pause reply and /health overlay."""
+    try:
+        if torch.cuda.is_available():
+            return round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Atomic snapshot write
 # ---------------------------------------------------------------------------
 
@@ -744,9 +762,50 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
         else:
             _persistent_dav2 = DepthAnythingV2Wrapper(cfg.dense_init.dav2).__enter__()
 
-    logger.info("[continuous] Trainer started; waiting for ≥4 images via /ingest")
+    logger.info(
+        f"[continuous] Trainer started; waiting for ≥{cfg.bootstrap.min_images} "
+        "images via /ingest")
 
-    while True:
+    def _do_pause():
+        """Serialize the GPU to COLMAP: move model + Adam state to CPU RAM,
+        free VRAM (no disk writes), ack the home-server, then park until the
+        capture queue drains and /resume moves everything back to the GPU.
+
+        The optimizer binding is preserved across the round trip, so training
+        continues from the exact paused state (MEGS-2 ingest contract §2/§3).
+        """
+        gaussians.to_cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        vram = _cuda_memory_mb()
+        ctrl.mark_paused(vram)
+        evlog.emit("pause", iter=global_iter, vram_mb=vram,
+                   splat_count=gaussians.num_primitives)
+        logger.info(f"[pause] model + Adam on CPU RAM; vram_mb={vram}")
+        # Park until the server hands the GPU back. Finite poll so a SIGINT
+        # (graceful stop) still lands promptly on this (main) thread.
+        while not ctrl.wait_for_resume(timeout=1.0):
+            pass
+        gaussians.to_cuda()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        ctrl.mark_resumed()
+        evlog.emit("resume", iter=global_iter,
+                   splat_count=gaussians.num_primitives)
+        logger.info("[resume] model + Adam back on GPU; training continues")
+
+    # The whole loop is wrapped so a SIGINT (home-server graceful stop) writes
+    # a final train_state.pt. The `while` is indented one short step under the
+    # `try` on purpose — it keeps the large loop body at its original column
+    # instead of reflowing every line.
+    try:
+      while True:
+        # ---- 0. GPU handoff: pause before the server runs COLMAP ----
+        if ctrl.pause_requested():
+            _do_pause()
+            continue
+
         # ---- 1. Handle pending checkpoint ----
         if ctrl.checkpoint_pending():
             path = write_snapshot_atomic(model_path, gaussians,
@@ -792,6 +851,18 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     dav2_model=_persistent_dav2,
                     max_gaussians=tc.num_max_ceiling,
                 )
+
+            # Early dense snapshot (MEGS-2 ingest contract §8): mirror the
+            # DA3-seeded cloud to the viewer's latest.ply *now*, so the new
+            # camera shows up within a second of ingest — before we spend any
+            # training iterations on it. Cheap next to the COLMAP cycle.
+            if gaussians._xyz_cohorts:
+                snap = write_snapshot_atomic(
+                    model_path, gaussians, export_dir, ctrl.session_id)
+                evlog.emit("early_snapshot", iter=global_iter, path=snap,
+                           session_id=req.session_id,
+                           image_name=req.image_name,
+                           splat_count=gaussians.num_primitives)
 
             # Parse match matrix if available
             matrix_path = prog_scene.snapshot_dir / "sparse/0/imageMatchMatrix.txt"
@@ -1118,7 +1189,32 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     f"N={gaussians._xyz.shape[0]} state={cur_state}"
                 )
 
-    # (unreachable — loop runs until KeyboardInterrupt / SIGTERM)
+    except KeyboardInterrupt:
+        # Graceful stop (home-server sends SIGINT on shutdown). Persist a
+        # final train_state.pt so --resume loses at most the in-flight iters.
+        logger.info("[shutdown] SIGINT — writing final train_state.pt")
+        try:
+            if gaussians.optimizer is not None:
+                # If paused (model on CPU), bring it back to GPU first so the
+                # saved tensors match the CUDA-resident restore path. The GPU
+                # is free during a clean shutdown; if it isn't, restore() also
+                # tolerates a CPU-saved state, so a failure here is non-fatal.
+                if ctrl.is_paused() and torch.cuda.is_available():
+                    try:
+                        gaussians.to_cuda()
+                        ctrl.mark_resumed()
+                    except Exception as e:
+                        logger.warning(
+                            f"[shutdown] to_cuda before save failed: {e}")
+                path = save_train_state(model_path, gaussians, monitor,
+                                        skipgs, ctrl, trainer_state_dict())
+                evlog.emit("shutdown", iter=global_iter, path=path)
+                logger.info(f"[shutdown] wrote {path}")
+            else:
+                logger.info("[shutdown] no optimizer yet — nothing to persist")
+        except Exception as e:
+            logger.error(f"[shutdown] train_state save failed: {e}")
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1171,7 +1267,8 @@ def main():
 
     # Start HTTP server in background thread
     from scene.continuous_server import start_server
-    start_server(cfg.http.host, cfg.http.port, ctrl, cfg.http.checkpoint_timeout)
+    start_server(cfg.http.host, cfg.http.port, ctrl,
+                 cfg.http.checkpoint_timeout, cfg.http.pause_timeout)
     logger.info(f"[http] Listening on http://{cfg.http.host}:{cfg.http.port}")
 
     try:

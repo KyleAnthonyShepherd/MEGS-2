@@ -100,17 +100,19 @@ skipgs:
 # bootstrap — minimum images before optimizer steps begin.
 # ---------------------------------------------------------------------------
 bootstrap:
-  # accumulation_views: 4 requires at least 4 images without padding hacks.
-  # Until /ingest brings the count to this, the trainer idles in a "waiting
-  # for images" state and bootstrap_complete in /status stays false.
-  min_images: 4
+  # Minimum registered images before optimizer steps begin. Kept equal to the
+  # home-server's mapper gate (env SFM_MIN_IMAGES_TO_MAP, default 3) so the
+  # trainer bootstraps on the same image that first yields a reconstruction.
+  # Must be >= accumulation_views (2). Until /ingest brings the count to this,
+  # the trainer idles "waiting for images" and bootstrap_complete stays false.
+  min_images: 3
 
 # ---------------------------------------------------------------------------
 # training — substantive knobs for each action.
 # ---------------------------------------------------------------------------
 training:
   # Number of view micro-batches per optimizer step (gradient accumulation).
-  # MUST equal bootstrap.min_images or be ≤ it.
+  # MUST be <= bootstrap.min_images (3).
   accumulation_views: 2
 
   # Hard VRAM-bounded ceiling on total Gaussian count. lightweight_prune
@@ -183,10 +185,12 @@ training:
 dense_init:
   enabled: true
 
-  # Monocular-depth backend: dav2 | da3. Default stays dav2 until
-  # tools/bench_dense_init.py shows DA3 winning on quality at acceptable
-  # VRAM on the 6 GB target (commit the results table with the flip).
-  backend: dav2
+  # Monocular-depth backend: dav2 | da3. DA3 is the default on the 6 GB
+  # target: DA3-SMALL fits, and it accepts the COLMAP pose+intrinsics as
+  # conditioning (pose-conditioned depth) which dav2 cannot. Per-image DA3
+  # failures fall back to dav2 (da3_fallback_to_dav2). Set back to dav2 to
+  # disable pose-conditioned depth.
+  backend: da3
 
   # DA3 predicts depth directly; when its RANSAC fit comes out with a <= 0
   # for an image, retry just that image with DAv2 (models load sequentially,
@@ -258,3 +262,6 @@ http:
   # Max seconds a POST /checkpoint will block waiting for the trainer to
   # actually write the .ply. 0 = no timeout.
   checkpoint_timeout: 30
+  # Max seconds a POST /pause blocks for the trainer to move its model to CPU
+  # and free VRAM before COLMAP runs. Matches the home-server's 30 s block.
+  pause_timeout: 30
