@@ -12,6 +12,10 @@ from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from scene.index_remap import (
+    endcat_to_final_perm, old_to_new_after_append, old_to_new_after_prune,
+    remap_grace_records,
+)
 
 
 class SphericalGaussianModel:
@@ -754,6 +758,37 @@ class SphericalGaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+        # Grace records store flat-index ranges; pruning shifts flat indices,
+        # so translate the ranges or later grace masks protect the wrong rows.
+        if getattr(self, '_grace_records', None):
+            self._grace_records = remap_grace_records(
+                self._grace_records,
+                old_to_new_after_prune(valid_points_mask.detach().cpu().numpy()))
+
+    def _finalize_append(self, sizes_before, appended, nsac_chunks):
+        """Fix flat-order bookkeeping after per-cohort appends.
+
+        _append_to_cohort inserts new rows at the end of each *cohort* —
+        mid-flat-order — while naive `torch.cat((old, new))` bookkeeping
+        assumes the flat end. Rebuild _sg_axis_count in true flat order,
+        shift grace ranges, and return the endcat→final permutation (as a
+        torch index tensor) for callers that built masks in endcat order.
+        Returns None when nothing was appended.
+        """
+        if sum(appended) == 0:
+            return None
+        device = self._xyz_cohorts[0].device
+        perm = endcat_to_final_perm(sizes_before, appended)
+        perm_t = torch.as_tensor(perm, device=device, dtype=torch.long)
+        if nsac_chunks:
+            endcat = torch.cat([self._sg_axis_count, *nsac_chunks], dim=0)
+            self._sg_axis_count = endcat[perm_t]
+        if getattr(self, '_grace_records', None):
+            self._grace_records = remap_grace_records(
+                self._grace_records,
+                old_to_new_after_append(sizes_before, appended))
+        return perm_t
+
     # ------------------------------------------------------------------
     # Densification helpers
     # ------------------------------------------------------------------
@@ -857,6 +892,8 @@ class SphericalGaussianModel:
                     new_sg_ac_list.append((ci, self._sg_axis_count[offset:offset + s][cm].repeat(N)))
             offset += s
 
+        appended = [0] * len(sizes)
+        nsac_chunks = []
         for i, (ci, new_xyz) in enumerate(new_xyz_list):
             ci2, new_rgb_base = new_rgb_list[i]
             ci3, new_opacity = new_opacity_list[i]
@@ -869,16 +906,24 @@ class SphericalGaussianModel:
 
             self._append_to_cohort(ci, new_xyz, new_rgb_base, new_opacity, new_scaling, new_rotation, nsd, nss, nsr)
             if nsac is not None:
-                self._sg_axis_count = torch.cat((self._sg_axis_count, nsac), dim=0)
+                nsac_chunks.append(nsac)
+            appended[ci] += new_xyz.shape[0]
+
+        perm_t = self._finalize_append(sizes, appended, nsac_chunks)
 
         n_total = sum(c.shape[0] for c in self._xyz_cohorts)
         self.xyz_gradient_accum = torch.zeros((n_total, 1), device="cuda")
         self.denom = torch.zeros((n_total, 1), device="cuda")
         self.max_radii2D = torch.zeros(n_total, device="cuda")
 
+        # selected_pts_mask indexes the OLD flat order; appended rows sit
+        # mid-flat-order (end of each cohort), so build the split-parent
+        # prune mask in endcat order and permute it into true flat order.
         prune_filter = torch.cat((
             selected_pts_mask,
             torch.zeros(n_new_total, device="cuda", dtype=bool)))
+        if perm_t is not None:
+            prune_filter = prune_filter[perm_t]
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
@@ -889,6 +934,8 @@ class SphericalGaussianModel:
 
         sizes = self._cohort_sizes()
         n_new_total = 0
+        appended = [0] * len(sizes)
+        nsac_chunks = []
         full_xyz = self._xyz
         full_rgb_base = self._rgb_base
         full_opacity = self._opacity
@@ -918,9 +965,12 @@ class SphericalGaussianModel:
 
                 self._append_to_cohort(ci, new_xyz, new_rgb_base, new_opacity, new_scaling, new_rotation, nsd, nss, nsr)
                 if nsac is not None:
-                    self._sg_axis_count = torch.cat((self._sg_axis_count, nsac), dim=0)
+                    nsac_chunks.append(nsac)
+                appended[ci] = new_xyz.shape[0]
                 n_new_total += new_xyz.shape[0]
             offset += s
+
+        self._finalize_append(sizes, appended, nsac_chunks)
 
         n_total = sum(c.shape[0] for c in self._xyz_cohorts)
         self.xyz_gradient_accum = torch.zeros((n_total, 1), device="cuda")
@@ -948,13 +998,18 @@ class SphericalGaussianModel:
             viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def opacity_size_prune(self, min_opacity, max_screen_size, extent):
+    def opacity_size_prune(self, min_opacity, max_screen_size, extent,
+                           grace_iter=None):
+        """grace_iter: pass the current training iter to exempt
+        grace-protected (recently added) Gaussians from the prune."""
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size is not None:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(
                 torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if grace_iter is not None:
+            prune_mask = prune_mask & ~self.get_grace_protected_mask(grace_iter)
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
@@ -962,7 +1017,12 @@ class SphericalGaussianModel:
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity) * 0.01))
         self.replace_tensor_to_optimizer(opacities_new, "opacity")
 
-    def densify_and_prune_split(self, max_grad, min_opacity, extent, max_screen_size, mask):
+    def densify_and_prune_split(self, max_grad, min_opacity, extent, max_screen_size, mask,
+                                grace_iter=None):
+        """grace_iter: pass the current training iter to exempt
+        grace-protected Gaussians from the trailing opacity/size prune. The
+        mask is computed AFTER clone/split, whose index shifts are tracked
+        in the grace records by _finalize_append/prune_points."""
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -974,6 +1034,8 @@ class SphericalGaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        if grace_iter is not None:
+            prune_mask = prune_mask & ~self.get_grace_protected_mask(grace_iter)
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
@@ -993,6 +1055,8 @@ class SphericalGaussianModel:
 
         sizes = self._cohort_sizes()
         n_new_total = 0
+        appended = [0] * len(sizes)
+        nsac_chunks = []
         full_xyz = self._xyz
         full_rgb_base = self._rgb_base
         full_opacity = self._opacity
@@ -1031,18 +1095,25 @@ class SphericalGaussianModel:
 
                 self._append_to_cohort(ci, new_xyz, new_rgb_base, new_opacity, new_scaling, new_rotation, nsd, nss, nsr)
                 if nsac is not None:
-                    self._sg_axis_count = torch.cat((self._sg_axis_count, nsac), dim=0)
+                    nsac_chunks.append(nsac)
+                appended[ci] = new_xyz.shape[0]
                 n_new_total += new_xyz.shape[0]
             offset += s
+
+        perm_t = self._finalize_append(sizes, appended, nsac_chunks)
 
         n_total = sum(c.shape[0] for c in self._xyz_cohorts)
         self.xyz_gradient_accum = torch.zeros((n_total, 1), device="cuda")
         self.denom = torch.zeros((n_total, 1), device="cuda")
         self.max_radii2D = torch.zeros(n_total, device="cuda")
 
+        # See densify_and_split: mask built in endcat order, permuted to
+        # true flat order before pruning the split parents.
         prune_filter = torch.cat((
             selected_pts_mask,
             torch.zeros(n_new_total, device="cuda", dtype=bool)))
+        if perm_t is not None:
+            prune_filter = prune_filter[perm_t]
         self.prune_points(prune_filter)
 
     def reinitial_pts(self, pts, rgb):

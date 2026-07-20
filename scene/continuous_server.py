@@ -4,9 +4,19 @@ Runs in a daemon thread; shares a ControlState with the trainer.
 All requests and responses are JSON.
 
 Endpoints:
-    POST /ingest        body: {"snapshot_dir": "...", "request_id": "..."}
-                        → 202 {"request_id": "..."}
+    POST /ingest        Two accepted payload shapes:
+                        1. Home-server contract (app/api/trainer.py):
+                           {"session_id": str, "image_name": str,
+                            "image_path": str, "sparse_dir": str}
+                           snapshot_dir is derived from sparse_dir (which must
+                           end in sparse/<N>); idempotent on
+                           (session_id, image_name) — a duplicate POST is a
+                           200 no-op reporting the original request_id.
+                        2. Legacy: {"snapshot_dir": "...", "request_id": "..."}
+                        → 202 {"request_id": "..."} (200 on duplicate)
     POST /checkpoint    → 200 {"path": "..."}  (blocks until write completes)
+    GET  /health        → 200 {"state","iter","splat_count","queue_depth",
+                                "last_ingest","vram_mb", ...}
     GET  /status        → 200 {"gaussian_count":N, "monitor_state":"...", ...}
     GET  /status/{id}   → 200 {"state": "queued|integrating|training|converged|unknown"}
 """
@@ -14,7 +24,39 @@ Endpoints:
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Tuple
+
+
+def resolve_snapshot_dir(body: dict) -> Tuple[Optional[str], Optional[str]]:
+    """Derive the snapshot directory from an ingest payload.
+
+    Returns (snapshot_dir, error). Exactly one is non-None.
+
+    The home-server posts sparse_dir = <session_root>/sparse/<N>; the
+    snapshot root the trainer loads (images/ + sparse/0/) is <session_root>.
+    """
+    snap_dir = body.get("snapshot_dir")
+    sparse_dir = body.get("sparse_dir")
+
+    if not snap_dir and not sparse_dir:
+        return None, "snapshot_dir or sparse_dir required"
+
+    if not snap_dir:
+        sp = Path(sparse_dir)
+        # Expect .../<session_root>/sparse/<N>
+        if sp.parent.name != "sparse":
+            return None, (
+                f"sparse_dir must end in sparse/<N>, got {sparse_dir!r}")
+        snap_dir = str(sp.parent.parent)
+
+    root = Path(snap_dir)
+    sparse0 = root / "sparse" / "0"
+    if not any((sparse0 / f"cameras{ext}").exists() for ext in (".bin", ".txt")):
+        return None, f"no COLMAP reconstruction at {sparse0}"
+    if not (root / "images").is_dir():
+        return None, f"no images/ directory under {snap_dir}"
+    return snap_dir, None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -39,9 +81,10 @@ class _Handler(BaseHTTPRequestHandler):
             return {}
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw)
+            body = json.loads(raw)
         except json.JSONDecodeError:
             return None
+        return body if isinstance(body, dict) else None
 
     def do_POST(self):
         if self.path == "/ingest":
@@ -49,12 +92,33 @@ class _Handler(BaseHTTPRequestHandler):
             if body is None:
                 self._send_json(400, {"error": "invalid JSON"})
                 return
-            snap_dir = body.get("snapshot_dir")
-            if not snap_dir:
-                self._send_json(400, {"error": "snapshot_dir required"})
+
+            session_id = body.get("session_id")
+            image_name = body.get("image_name")
+
+            # One trainer process serves one session; reject cross-session
+            # ingests loudly rather than silently mixing scenes.
+            pinned = self.ctrl.session_id
+            if session_id and pinned and session_id != pinned:
+                self._send_json(409, {
+                    "error": f"trainer is bound to session {pinned!r}",
+                    "session_id": pinned,
+                })
                 return
-            rid = self.ctrl.enqueue_ingest(snap_dir, body.get("request_id"))
-            self._send_json(202, {"request_id": rid})
+
+            snap_dir, err = resolve_snapshot_dir(body)
+            if err:
+                self._send_json(400, {"error": err})
+                return
+
+            rid, duplicate = self.ctrl.enqueue_ingest(
+                snap_dir, body.get("request_id"),
+                session_id=session_id, image_name=image_name,
+            )
+            if duplicate:
+                self._send_json(200, {"request_id": rid, "duplicate": True})
+            else:
+                self._send_json(202, {"request_id": rid})
 
         elif self.path == "/checkpoint":
             self.ctrl.request_checkpoint()
@@ -68,7 +132,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_GET(self):
-        if self.path == "/status":
+        if self.path == "/health":
+            self._send_json(200, self.ctrl.health_snapshot())
+
+        elif self.path == "/status":
             self._send_json(200, self.ctrl.status_snapshot())
 
         elif self.path.startswith("/status/"):

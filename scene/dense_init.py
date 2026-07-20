@@ -46,6 +46,27 @@ class DAv2Config:
 
 
 @dataclass
+class DA3Config:
+    """Depth Anything 3 backend config.
+
+    model_name is a HuggingFace repo id. On the 6 GB target start with the
+    any-view DA3-SMALL; DA3MONO-LARGE / DA3METRIC-LARGE exist only in LARGE
+    and need headroom checks before use. All DA3 models predict *depth*
+    directly (not disparity like DAv2), so the RANSAC-fitted scale `a`
+    must come out positive — a negative fit means something is wrong
+    (see validate_alignment).
+    """
+    model_name: str = "depth-anything/DA3-SMALL"
+    device: str = "cuda"
+    process_res: int = 504
+    # Pass the session's COLMAP pose/intrinsics as conditioning. Single-image
+    # calls mostly benefit from the intrinsics (FOV prior); extrinsics matter
+    # once multi-image batches are used.
+    conditioning: bool = True
+    use_ray_pose: bool = False
+
+
+@dataclass
 class RansacConfig:
     iterations: int = 200
     inlier_threshold: float = 0.05   # fraction of scene_scale
@@ -147,6 +168,129 @@ class DepthAnythingV2Wrapper:
         ).squeeze().cpu()
 
         return depth
+
+
+# ---------------------------------------------------------------------------
+# DA3 context manager
+# ---------------------------------------------------------------------------
+
+class DepthAnything3Wrapper:
+    """Loads Depth Anything 3 on __enter__, frees ALL GPU memory on __exit__.
+
+    Same context-manager contract as DepthAnythingV2Wrapper; additionally
+    accepts_camera=True — predict() takes an optional MEGS-2 Camera whose
+    COLMAP pose/intrinsics are passed to DA3 as conditioning.
+
+    Deferred (TODO sketches, do not build yet — see Plan 2 Milestone 4.5):
+      - infer_gs=True feed-forward 3DGS head as an instant-preview path
+        (render something seconds after the first photos, before MEGS-2
+        refinement takes over);
+      - DA3 pose estimation as an SfM-bootstrap-failure fallback (run
+        inference() WITHOUT extrinsics over the accumulated images and use
+        prediction.extrinsics as provisional poses);
+      - DA3-Streaming variant for continuous capture.
+    """
+
+    accepts_camera = True
+
+    def __init__(self, cfg: DA3Config):
+        self.cfg = cfg
+        self.model = None
+        self._vram_baseline = 0
+
+    def __enter__(self):
+        from depth_anything_3.api import DepthAnything3
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
+            self._vram_baseline = torch.cuda.memory_allocated()
+        self.model = DepthAnything3.from_pretrained(
+            self.cfg.model_name).to(self.cfg.device).eval()
+        return self
+
+    def __exit__(self, *args):
+        del self.model
+        self.model = None
+        gc.collect()
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            residue_mb = (torch.cuda.memory_allocated()
+                          - self._vram_baseline) / (1024 ** 2)
+            if residue_mb > 100:
+                logger.warning(
+                    f"[dense-init] DA3 leaked {residue_mb:.0f} MB VRAM after "
+                    "__exit__ — check for lingering references")
+
+    def predict(self, image_chw, camera=None) -> "torch.Tensor":
+        """Predict a depth map for one image.
+
+        Args:
+            image_chw: (3, H, W) float tensor in [0, 1], on any device.
+            camera: optional MEGS-2 Camera; when given (and
+                cfg.conditioning), its COLMAP pose + intrinsics are passed
+                to DA3 as conditioning.
+
+        Returns:
+            (H, W) float32 tensor on CPU — DA3 raw output. This is direct
+            depth (larger = farther), unlike DAv2's disparity; the RANSAC
+            alignment absorbs scale either way, but the fitted `a` must be
+            positive (validate_alignment).
+        """
+        import torch as _torch
+        img_np = (image_chw.cpu().float().permute(1, 2, 0).numpy()
+                  * 255).astype(np.uint8)
+
+        kwargs = {}
+        if camera is not None and self.cfg.conditioning:
+            ext, ixt = camera_to_da3_conditioning(camera)
+            kwargs["extrinsics"] = ext
+            kwargs["intrinsics"] = ixt
+        if self.cfg.use_ray_pose:
+            kwargs["use_ray_pose"] = True
+
+        with _torch.no_grad():
+            prediction = self.model.inference(
+                [img_np], process_res=self.cfg.process_res, **kwargs)
+
+        depth = _torch.as_tensor(
+            np.asarray(prediction.depth[0]), dtype=_torch.float32)
+        depth = _torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+
+        H_orig, W_orig = image_chw.shape[1], image_chw.shape[2]
+        if depth.shape != (H_orig, W_orig):
+            depth = _torch.nn.functional.interpolate(
+                depth.unsqueeze(0).unsqueeze(0),
+                size=(H_orig, W_orig), mode="bilinear", align_corners=False,
+            ).squeeze()
+        return depth.cpu()
+
+
+def camera_to_da3_conditioning(camera):
+    """Build DA3 conditioning arrays from a MEGS-2 Camera.
+
+    Returns (extrinsics (1, 4, 4), intrinsics (1, 3, 3)) float32 numpy —
+    OpenCV/COLMAP world-to-camera convention, which is what both MEGS-2
+    (DL3) and DA3 use.
+    """
+    ext = _get_w2c(camera).astype(np.float32)[None]
+    fx, fy, cx, cy = _get_camera_intrinsics(camera)
+    ixt = np.array([[fx, 0.0, cx],
+                    [0.0, fy, cy],
+                    [0.0, 0.0, 1.0]], dtype=np.float32)[None]
+    return ext, ixt
+
+
+def validate_alignment(backend: str, result: "AlignmentResult"):
+    """Backend-specific sanity on the RANSAC fit. Returns (ok, reason).
+
+    DAv2 predicts disparity, so a < 0 is the normal, expected fit.
+    DA3 predicts depth directly, so a must be positive — a negative fit
+    means the model output or the projection is wrong for this image and
+    its dense points must not be trusted.
+    """
+    if backend == "da3" and result.a <= 0:
+        return False, (f"DA3 fitted a={result.a:.4f} <= 0 but DA3 predicts "
+                       "direct depth — rejecting this image's dense init")
+    return True, ""
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,29 @@ class SkipGSGate:
         # Consecutive "improving" samples seen after _enabled became True
         self._steady_count = 0
 
+    def get_state(self) -> dict:
+        """Serializable state for checkpoint/resume."""
+        return {
+            "ema": dict(self._ema),
+            "step": self._step,
+            "backward_count": self._backward_count,
+            "warmup_would_fire": self._warmup_would_fire,
+            "warmup_evaluable": self._warmup_evaluable,
+            "rho_min": self._rho_min,
+            "enabled": self._enabled,
+            "steady_count": self._steady_count,
+        }
+
+    def set_state(self, state: dict):
+        self._ema = dict(state["ema"])
+        self._step = state["step"]
+        self._backward_count = state["backward_count"]
+        self._warmup_would_fire = state["warmup_would_fire"]
+        self._warmup_evaluable = state["warmup_evaluable"]
+        self._rho_min = state["rho_min"]
+        self._enabled = state["enabled"]
+        self._steady_count = state["steady_count"]
+
     def notify_monitor_state(self, state: str):
         """Call each iteration with the current monitor state string.
 

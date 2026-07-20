@@ -20,10 +20,20 @@ def parse_match_matrix(
 
     Returns an (M, M) float32 log-normalised matrix, where M = len(ordered_camera_names).
     Cameras absent from the file get row/col of zeros.
+
+    Two producer formats are accepted (auto-detected):
+      - GS_On-The-Fly: imagesNames.txt is one comma-separated line;
+        matrix rows are comma-separated.
+      - home-server (app/api/trainer.py export_match_matrix): one name per
+        line; matrix rows are space-separated.
     """
     with open(names_path, "r") as f:
         raw = f.read().strip()
-    file_names = [n.strip() for n in raw.split(",") if n.strip()]
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        file_names = lines
+    else:
+        file_names = [n.strip() for n in raw.split(",") if n.strip()]
 
     # Strip extensions so we match on stems only
     def stem(name: str) -> str:
@@ -38,7 +48,8 @@ def parse_match_matrix(
             line = line.strip()
             if not line:
                 continue
-            rows_raw.append([int(x) for x in line.split(",")])
+            sep = "," if "," in line else None  # None = any whitespace
+            rows_raw.append([int(x) for x in line.split(sep) if x.strip()])
 
     n_file = len(file_stems)
     raw_matrix = np.zeros((n_file, n_file), dtype=np.float32)

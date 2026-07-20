@@ -15,6 +15,7 @@ Usage:
 import gc
 import logging
 import os
+import shutil
 import sys
 import uuid
 from argparse import ArgumentParser, Namespace
@@ -33,9 +34,10 @@ from scene.spherical_gaussian_model import SphericalGaussianModel
 from scene.progressive_scene import ProgressiveScene
 from scene.match_matrix import parse_match_matrix, compute_image_weights
 from scene.dense_init import (
-    DepthAnythingV2Wrapper, align_depth_to_sfm, depth_to_points,
+    DepthAnythingV2Wrapper, DepthAnything3Wrapper, validate_alignment,
+    align_depth_to_sfm, depth_to_points,
     transform_to_camera_frame, AlignmentFailed,
-    DAv2Config, RansacConfig,
+    DAv2Config, DA3Config, RansacConfig,
 )
 from scene.convergence import ConvergenceMonitor
 from scene.triggers import (
@@ -44,6 +46,8 @@ from scene.triggers import (
 )
 from scene.skipgs import SkipGSGate
 from scene.control_state import ControlState
+from scene.event_log import EventLog
+from scene.optim_guard import optimizer_binding_ok
 from spherical_gaussian_renderer import render_imp
 from utils.loss_utils import l1_loss, ssim
 from utils.graphics_utils import BasicPointCloud
@@ -127,11 +131,22 @@ class TrainingConfig:
     # rendered images via a per-image EMA of recent loss.
     image_error_weighting: bool = True
     image_error_ema_beta: float = 0.95
+    # Crash resilience: write train_state.pt (model + optimizer + monitor +
+    # ingest ledger) every N optimizer iters. 0 disables periodic saves
+    # (a save still happens at each converged-idle transition).
+    train_state_interval_iters: int = 500
 
 
 @dataclass
 class DenseInitConfig:
     enabled: bool = True
+    # dav2 | da3 — default stays dav2 until tools/bench_dense_init.py shows
+    # DA3 winning on quality at acceptable VRAM on the target machine.
+    backend: str = "dav2"
+    # When the DA3 fit fails its direct-depth sanity check for an image,
+    # retry just that image with DAv2 (contexts run sequentially, so the
+    # two models are never co-resident on GPU).
+    da3_fallback_to_dav2: bool = True
     min_sfm_points_for_alignment: int = 10
     min_sfm_depth_range_fraction: float = 0.10
     target_dense_points_per_image: int = 30_000
@@ -141,13 +156,14 @@ class DenseInitConfig:
     grace_iters: int = 20
     persist_model: bool = False
     dav2: DAv2Config = field(default_factory=DAv2Config)
+    da3: DA3Config = field(default_factory=DA3Config)
     ransac: RansacConfig = field(default_factory=RansacConfig)
 
 
 @dataclass
 class HttpConfig:
     host: str = "127.0.0.1"
-    port: int = 8765
+    port: int = 8666
     checkpoint_timeout: float = 30.0
 
 
@@ -198,6 +214,8 @@ def load_config(yaml_path: str) -> ContinuousConfig:
         for k, v in di.items():
             if k == "dav2":
                 _apply_dict(cfg.dense_init.dav2, v)
+            elif k == "da3":
+                _apply_dict(cfg.dense_init.da3, v)
             elif k == "ransac":
                 _apply_dict(cfg.dense_init.ransac, v)
             elif hasattr(cfg.dense_init, k):
@@ -335,9 +353,14 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
     accumulated_xyz = []
     accumulated_rgb = []
     scene_scale = prog_scene.cameras_extent
+    backend = getattr(dense_cfg, 'backend', 'dav2')
+    # Cameras whose DA3 fit failed the direct-depth sanity check; retried
+    # with DAv2 after the DA3 context closes (never co-resident on GPU).
+    fallback_cams = []
 
-    def _run_cameras(depth_model):
-        for cam in new_cams:
+    def _run_cameras(depth_model, cams, model_backend):
+        pass_camera = getattr(depth_model, 'accepts_camera', False)
+        for cam in cams:
             sfm_xyz_all, visible_mask = prog_scene.get_sfm_points_visible_to(cam)
             sfm_xyz_visible = sfm_xyz_all[visible_mask]
 
@@ -349,7 +372,10 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
             if depth_range < dense_cfg.min_sfm_depth_range_fraction * scene_scale:
                 continue
 
-            depth_map = depth_model.predict(cam.original_image.cpu())
+            if pass_camera:
+                depth_map = depth_model.predict(cam.original_image.cpu(), camera=cam)
+            else:
+                depth_map = depth_model.predict(cam.original_image.cpu())
 
             try:
                 result = align_depth_to_sfm(
@@ -358,6 +384,13 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
                 )
             except AlignmentFailed as e:
                 logger.warning(f"[dense-init] alignment failed for {cam.image_name}: {e}")
+                del depth_map
+                continue
+
+            ok, reason = validate_alignment(model_backend, result)
+            if not ok:
+                logger.warning(f"[dense-init] {cam.image_name}: {reason}")
+                fallback_cams.append(cam)
                 del depth_map
                 continue
 
@@ -382,11 +415,26 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
                 f"(a={result.a:.3f}, b={result.b:.3f}, inliers={result.n_inliers})"
             )
 
-    if dav2_model is not None:
-        _run_cameras(dav2_model)
+    if backend == "da3":
+        if dav2_model is not None:
+            logger.warning(
+                "[dense-init] persist_model is only supported for the dav2 "
+                "backend; ignoring persistent handle for da3")
+        with DepthAnything3Wrapper(dense_cfg.da3) as depth_model:
+            _run_cameras(depth_model, new_cams, "da3")
+        if fallback_cams and getattr(dense_cfg, 'da3_fallback_to_dav2', True):
+            logger.warning(
+                f"[dense-init] retrying {len(fallback_cams)} image(s) with "
+                "DAv2 after DA3 sanity failure")
+            retry = list(fallback_cams)
+            fallback_cams.clear()
+            with DepthAnythingV2Wrapper(dense_cfg.dav2) as depth_model:
+                _run_cameras(depth_model, retry, "dav2")
+    elif dav2_model is not None:
+        _run_cameras(dav2_model, new_cams, "dav2")
     else:
         with DepthAnythingV2Wrapper(dense_cfg.dav2) as depth_model:
-            _run_cameras(depth_model)
+            _run_cameras(depth_model, new_cams, "dav2")
 
     if not accumulated_xyz:
         return
@@ -474,16 +522,87 @@ def run_lightweight_prune(gaussians, prog_scene, opt, cfg, global_iter):
 
 
 # ---------------------------------------------------------------------------
+# In-loop invariants (Plan 2 Milestone 2.2/2.3) — cheap, always-on. Violations
+# never crash training: they log an error and emit an invariant_violation
+# event, which the regression harness's trigger-sequence diff will surface.
+# ---------------------------------------------------------------------------
+
+def check_invariants(gaussians, tc, evlog, global_iter, where):
+    n = gaussians._xyz.shape[0]
+    if n > tc.num_max_ceiling:
+        logger.error(
+            f"[invariant] splat count {n} exceeds VRAM ceiling "
+            f"{tc.num_max_ceiling} after {where}")
+        evlog.emit("invariant_violation", kind="ceiling_exceeded",
+                   iter=global_iter, where=where, splat_count=n,
+                   ceiling=tc.num_max_ceiling)
+    if not optimizer_binding_ok(getattr(gaussians, "optimizer", None)):
+        logger.error(
+            f"[invariant] optimizer state keyed by stale params after {where} "
+            "— Adam momentum was lost (T1 regression)")
+        evlog.emit("invariant_violation", kind="optimizer_binding",
+                   iter=global_iter, where=where)
+
+
+# ---------------------------------------------------------------------------
 # Atomic snapshot write
 # ---------------------------------------------------------------------------
 
-def write_snapshot_atomic(model_path: str, gaussians: SphericalGaussianModel) -> str:
-    """Write current.ply atomically; return final path."""
+def write_snapshot_atomic(model_path: str, gaussians: SphericalGaussianModel,
+                          export_dir: Optional[str] = None,
+                          session_id: Optional[str] = None) -> str:
+    """Write current.ply atomically; return final path.
+
+    When export_dir and session_id are set, also mirror the snapshot to
+    <export_dir>/<session_id>/latest.ply — the path the home-server's
+    viewer reads (app/api/trainer.py latest_splat_ply)."""
     out_dir = Path(model_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / "current.ply.tmp"
     final = out_dir / "current.ply"
     gaussians.save_ply(str(tmp))
+    os.replace(str(tmp), str(final))
+
+    if export_dir and session_id:
+        try:
+            exp_dir = Path(export_dir) / session_id
+            exp_dir.mkdir(parents=True, exist_ok=True)
+            exp_tmp = exp_dir / "latest.ply.tmp"
+            shutil.copyfile(final, exp_tmp)
+            os.replace(str(exp_tmp), str(exp_dir / "latest.ply"))
+        except OSError as e:
+            logger.warning(f"[snapshot] export mirror failed: {e}")
+
+    return str(final)
+
+
+# ---------------------------------------------------------------------------
+# Train-state checkpoint (crash resilience / --resume)
+# ---------------------------------------------------------------------------
+
+TRAIN_STATE_NAME = "train_state.pt"
+
+
+def save_train_state(model_path: str, gaussians, monitor, skipgs, ctrl,
+                     trainer_state: dict) -> str:
+    """Atomically persist everything needed to continue a session after a
+    process restart: model tensors + Adam state (gaussians.capture()), grace
+    records, convergence-monitor state, SkipGS gate state, the ingest
+    idempotency ledger, and the trainer-loop counters."""
+    ckpt = {
+        "version": 1,
+        "model": gaussians.capture(),
+        "grace_records": [tuple(r) for r in getattr(gaussians, "_grace_records", [])],
+        "monitor": monitor.get_state(),
+        "skipgs": skipgs.get_state() if skipgs is not None else None,
+        "ledger": ctrl.ledger_state(),
+        "trainer": trainer_state,
+    }
+    out_dir = Path(model_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = out_dir / (TRAIN_STATE_NAME + ".tmp")
+    final = out_dir / TRAIN_STATE_NAME
+    torch.save(ckpt, str(tmp))
     os.replace(str(tmp), str(final))
     return str(final)
 
@@ -545,17 +664,93 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
     global_iter = 0
     ema_loss = 0.0
     bootstrapped = False
+    warned_no_match_matrix = False
+    export_dir = getattr(args, 'export_dir', None) or None
+
+    last_snapshot_dir = None
+    evlog = EventLog(os.path.join(model_path, "events.jsonl"))
+
+    def trainer_state_dict():
+        return {
+            "global_iter": global_iter,
+            "ema_loss": ema_loss,
+            "iters_since_densify": iters_since_densify,
+            "iters_since_fast_prune": iters_since_fast_prune,
+            "iters_since_lw_prune": iters_since_lw_prune,
+            "iters_since_cull": iters_since_cull,
+            "n_at_last_prune": n_at_last_prune,
+            "cycle_at_last_cull": cycle_at_last_cull,
+            "wrote_current_at_cycle": wrote_current_at_cycle,
+            "last_snapshot_dir": last_snapshot_dir,
+            "image_error_ema": dict(prog_scene.image_error_ema),
+            "image_weights": (
+                prog_scene.image_weights.tolist()
+                if prog_scene.image_weights is not None else None),
+        }
+
+    # ---- Resume from a previous run's train state ----
+    train_state_path = Path(model_path) / TRAIN_STATE_NAME
+    if getattr(args, "resume", False):
+        if train_state_path.exists():
+            ckpt = torch.load(str(train_state_path), weights_only=False)
+            ts = ckpt["trainer"]
+            last_snapshot_dir = ts.get("last_snapshot_dir")
+            if last_snapshot_dir and Path(last_snapshot_dir).exists():
+                # Cumulative snapshot: re-adding the latest one rebuilds the
+                # full camera set and sparse cloud.
+                prog_scene.add_snapshot(last_snapshot_dir)
+            else:
+                logger.warning(
+                    f"[resume] last snapshot dir missing ({last_snapshot_dir}); "
+                    "cameras will rebuild on the next ingest")
+            gaussians.restore(ckpt["model"], opt)
+            gaussians._grace_records = [
+                tuple(r) for r in ckpt.get("grace_records", [])]
+            monitor.set_state(ckpt["monitor"])
+            if skipgs is not None and ckpt.get("skipgs") is not None:
+                skipgs.set_state(ckpt["skipgs"])
+            ctrl.restore_ledger(ckpt.get("ledger", {}))
+            global_iter = ts["global_iter"]
+            ema_loss = ts["ema_loss"]
+            iters_since_densify = ts["iters_since_densify"]
+            iters_since_fast_prune = ts["iters_since_fast_prune"]
+            iters_since_lw_prune = ts["iters_since_lw_prune"]
+            iters_since_cull = ts["iters_since_cull"]
+            n_at_last_prune = ts["n_at_last_prune"]
+            cycle_at_last_cull = ts["cycle_at_last_cull"]
+            wrote_current_at_cycle = ts["wrote_current_at_cycle"]
+            prog_scene.image_error_ema = dict(ts.get("image_error_ema", {}))
+            if ts.get("image_weights") is not None:
+                prog_scene.image_weights = np.array(
+                    ts["image_weights"], dtype=np.float32)
+            evlog.emit("resume", iter=global_iter,
+                       n_images=prog_scene.n_images,
+                       splat_count=gaussians._xyz.shape[0])
+            logger.info(
+                f"[resume] restored iter={global_iter} "
+                f"N={gaussians._xyz.shape[0]} images={prog_scene.n_images} "
+                f"session={ctrl.session_id}")
+        else:
+            logger.warning(
+                f"[resume] requested but {train_state_path} not found; "
+                "starting fresh")
 
     _persistent_dav2 = None
     if cfg.dense_init.persist_model:
-        _persistent_dav2 = DepthAnythingV2Wrapper(cfg.dense_init.dav2).__enter__()
+        if cfg.dense_init.backend == "da3":
+            logger.warning(
+                "[dense-init] persist_model not supported with backend=da3; "
+                "DA3 loads per ingest")
+        else:
+            _persistent_dav2 = DepthAnythingV2Wrapper(cfg.dense_init.dav2).__enter__()
 
     logger.info("[continuous] Trainer started; waiting for ≥4 images via /ingest")
 
     while True:
         # ---- 1. Handle pending checkpoint ----
         if ctrl.checkpoint_pending():
-            path = write_snapshot_atomic(model_path, gaussians)
+            path = write_snapshot_atomic(model_path, gaussians,
+                                         export_dir, ctrl.session_id)
             ctrl.complete_checkpoint(path)
             logger.info(f"[checkpoint] wrote {path}")
 
@@ -608,6 +803,13 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 prog_scene.image_weights = compute_image_weights(
                     prog_scene.image_match_matrix, new_cam_indices)
             else:
+                if not warned_no_match_matrix:
+                    logger.warning(
+                        "[ingest] no imageMatchMatrix.txt/imagesNames.txt in "
+                        f"{prog_scene.snapshot_dir}/sparse/0 — using uniform "
+                        "weights with new-camera bias (L8 fallback); this "
+                        "warning is logged once")
+                    warned_no_match_matrix = True
                 M = len(prog_scene.train_cameras)
                 weights = np.ones(M, dtype=np.float32) * 0.5
                 for i in new_cam_indices:
@@ -625,6 +827,15 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 skipgs._enabled = False
                 skipgs._steady_count = 0
 
+            check_invariants(gaussians, tc, evlog, global_iter, "ingest")
+            last_snapshot_dir = req.snapshot_dir
+            evlog.emit("ingest", iter=global_iter,
+                       snapshot_dir=req.snapshot_dir,
+                       session_id=req.session_id,
+                       image_name=req.image_name,
+                       n_images=prog_scene.n_images,
+                       n_new_cams=len(new_cams),
+                       splat_count=gaussians._xyz.shape[0])
             ctrl.set_request_state(req.request_id, "training")
 
         # ---- 3. Bootstrap gate ----
@@ -638,6 +849,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
             ) if n_images_now > 0 else "initializing",
             n_images=n_images_now,
             bootstrap_complete=bootstrapped,
+            iteration=global_iter,
         )
 
         if not bootstrapped:
@@ -672,20 +884,29 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     cycle_at_last_cull = monitor.cycle
                     iters_since_cull = 0
                     torch.cuda.empty_cache()
+                    evlog.emit("cull_sg_axes", iter=global_iter,
+                               state=cur_state, splat_count=n_unchanged)
                     logger.info(
                         f"[cull] SG axes pruned; Gaussian count unchanged at {n_unchanged}"
                     )
                     continue
 
             if wrote_current_at_cycle != monitor.cycle:
-                path = write_snapshot_atomic(model_path, gaussians)
+                path = write_snapshot_atomic(model_path, gaussians,
+                                             export_dir, ctrl.session_id)
                 wrote_current_at_cycle = monitor.cycle
+                evlog.emit("converged", iter=global_iter,
+                           splat_count=gaussians._xyz.shape[0],
+                           n_images=prog_scene.n_images, snapshot=path)
+                save_train_state(model_path, gaussians, monitor, skipgs,
+                                 ctrl, trainer_state_dict())
                 logger.info(f"[converged] Wrote {path}; idling until next ingest or checkpoint")
             ctrl.update_status(
                 gaussian_count=gaussians._xyz.shape[0],
                 monitor_state="converged",
                 n_images=prog_scene.n_images,
                 bootstrap_complete=bootstrapped,
+                iteration=global_iter,
             )
             ctrl.wait_for_work(timeout=5.0)
             continue
@@ -816,11 +1037,16 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                             opt.densify_grad_threshold, 0.005,
                             prog_scene.cameras_extent, None,
                             mask_blur[:gaussians.xyz_gradient_accum.shape[0]],
+                            grace_iter=global_iter,
                         )
                         n_after = gaussians._xyz.shape[0]
+                        check_invariants(gaussians, tc, evlog, global_iter,
+                                         "densify")
                         monitor.update_densify(max(n_after - n_before, 0), n_after)
                         fraction_changed = abs(n_after - n_before) / max(n_after, 1)
                         monitor.reset(fraction_changed=fraction_changed)
+                        evlog.emit("densify", iter=global_iter, state=cur_state,
+                                   n_before=n_before, n_after=n_after)
                         # mask_blur is reallocated at the top of the next iter
                         # when n_total changes; no need to reset here.
                         iters_since_densify = 0
@@ -836,11 +1062,16 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     gaussians.opacity_size_prune(
                         min_opacity=0.005, max_screen_size=None,
                         extent=prog_scene.cameras_extent,
+                        grace_iter=global_iter,
                     )
                     n_after_fp = gaussians._xyz.shape[0]
+                    check_invariants(gaussians, tc, evlog, global_iter,
+                                     "fast_prune")
                     fraction_pruned = (n_before_fp - n_after_fp) / max(n_before_fp, 1)
                     monitor.reset(fraction_changed=fraction_pruned)
                     iters_since_fast_prune = 0
+                    evlog.emit("fast_prune", iter=global_iter, state=cur_state,
+                               n_before=n_before_fp, n_after=n_after_fp)
 
                 # ---- Lightweight importance prune ----
                 if should_lightweight_prune(
@@ -852,10 +1083,15 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 ):
                     n_before_prune = gaussians._xyz.shape[0]
                     run_lightweight_prune(gaussians, prog_scene, opt, cfg, global_iter)
+                    check_invariants(gaussians, tc, evlog, global_iter,
+                                     "lightweight_prune")
                     n_at_last_prune = gaussians._xyz.shape[0]
                     fraction_pruned = (n_before_prune - n_at_last_prune) / max(n_before_prune, 1)
                     monitor.reset(fraction_changed=fraction_pruned)
                     iters_since_lw_prune = 0
+                    evlog.emit("lightweight_prune", iter=global_iter,
+                               state=cur_state, n_before=n_before_prune,
+                               n_after=n_at_last_prune)
 
                 # SG axis cull is only handled in the converged-idle gate at
                 # the top of the loop — its require_state is ["converged"],
@@ -869,6 +1105,12 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
             iters_since_fast_prune += 1
             iters_since_lw_prune += 1
             iters_since_cull += 1
+
+            if (tc.train_state_interval_iters > 0
+                    and global_iter % tc.train_state_interval_iters == 0):
+                path = save_train_state(model_path, gaussians, monitor,
+                                        skipgs, ctrl, trainer_state_dict())
+                evlog.emit("train_state", iter=global_iter, path=path)
 
             if global_iter % 100 == 0:
                 logger.info(
@@ -892,6 +1134,15 @@ def main():
     parser.add_argument("--config", type=str, default="configs/continuous.yaml")
     parser.add_argument("--http_host", type=str, default=None)
     parser.add_argument("--http_port", type=int, default=None)
+    parser.add_argument(
+        "--export_dir", type=str,
+        default=os.environ.get("TRAINER_EXPORT_DIR", ""),
+        help="Mirror snapshots to <export_dir>/<session_id>/latest.ply for the "
+             "home-server viewer (defaults to $TRAINER_EXPORT_DIR)")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Restore model/optimizer/monitor/ledger from "
+             "<model_path>/train_state.pt and continue the session")
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()

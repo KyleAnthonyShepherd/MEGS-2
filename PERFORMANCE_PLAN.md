@@ -1,5 +1,23 @@
 # Progressive MEGS-2 Performance Plan
 
+> **Status (2026-07, continuous_train.py era).** Verified against the code
+> rather than assumed (several tasks landed while this doc aged):
+> **T1** — the post-prune `training_setup` call sites this task targeted
+> lived in `progressive_train.py`, which no longer exists; the single
+> remaining `training_setup` call (first-snapshot init in
+> `continuous_train.py`) is a true reinit. `reset_densification_buffers`
+> exists on the model, and the always-on `optimizer_binding_ok` invariant
+> (scene/optim_guard.py, wired into check_invariants) now catches any
+> future momentum-losing rebind. **T2** — landed (view-dir math hoisted in
+> `compute_colors_precomp`, commit 4679373). **T3/T4** — landed
+> (`dense_init` config, `persist_model`); DA3 backend added later, see
+> docs/dense_init_backends.md. **T5** — landed
+> (`imp_score_camera_subsample`, default 0). **T6** — landed
+> (`training.accumulation_views`, default 4). **T7/T8** — landed
+> (scene/convergence.py, scene/triggers.py, scene/skipgs.py), unit-tested
+> in tests/test_convergence.py, test_triggers.py, test_skipgs.py, and
+> regression-gated via tests/regression/. **T9** — still deferred.
+
 **Target system**: GTX 1660 Ti (Turing SM 7.5), 6 GB VRAM, Linux, CUDA 12.1.
 **Workload**: streaming progressive ingestion — one new phone-camera image every ~12 s; ~13 images / ~800k splats steady-state; ~1.5 GB VRAM utilised → ~4.5 GB headroom.
 **Branch**: `claude/optimize-low-vram-performance-ECpjf` atop `incremental`.
