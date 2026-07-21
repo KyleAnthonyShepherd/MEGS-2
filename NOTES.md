@@ -13,6 +13,8 @@ first thing to re-read.
 | DL2 — DAv2 outputs disparity, DA3 outputs depth | `tests/test_dense_init_da3.py::test_validate_alignment_*` (sign gate per backend) |
 | T1 — Adam state lost on rebind after prune | `tests/test_optim_guard.py` (+ always-on `check_invariants`) |
 | T1 (pause/resume) — Adam state must survive a to_cpu()→to_cuda() round trip | `tests/test_pause_resume.py::test_model_to_cpu_to_cuda_round_trip` (binding + bitwise equality + loss keeps falling; GPU-gated) |
+| DA3 single-image conditioning must not pass extrinsics (degenerate Umeyama) | `tests/test_dense_init_da3.py::test_da3_predict_conditions_on_intrinsics_only_by_default` |
+| dense.ply must be a plain xyz+rgb cloud, atomic, bounded | `tests/test_dense_cloud.py` (format, color scaling, subsample cap, atomicity) |
 | Grace ranges stale after prune / mid-order densify append | `tests/test_index_remap.py` (incl. simulated historical misalignment) |
 | `_sg_axis_count` / split prune-mask end-append misalignment | `tests/test_index_remap.py::test_simulated_axis_count_stays_aligned_through_clone_and_prune`, `::test_perm_gathers_endcat_into_final_order` |
 | Scheduler bugs: densify_saturation never aging out; stalled grinding forever | `tests/test_convergence.py::test_densify_saturation_ages_out_by_iter`, `::test_plateau_reads_stalled_then_promotes_to_converged` |
@@ -48,8 +50,11 @@ VRAM freed, **no disk writes**) before each image's COLMAP work, then RESUMES
   empty_cache/synchronize → ack → park until resume → to_cuda), then
   continues. SIGINT now writes a final `train_state.pt` (bringing the model
   back to GPU first if paused; `restore()` also tolerates a CPU-saved state).
-  After each ingest's dense-init it writes an **early snapshot** so the
-  viewer's `latest.ply` reflects the new camera before training.
+  After each ingest's dense-init it writes **two early artifacts** for the
+  viewer: `latest.ply` (heavy splat model) and a separate lightweight
+  `dense.ply` point cloud (accumulated DA3 dense + current sparse points,
+  `float x,y,z`+`uchar rgb`, subsampled to `preview_max_points`) — the
+  server's independent "dense cloud" vs "splats" layers.
 - **Config:** `bootstrap.min_images: 3` (matches `SFM_MIN_IMAGES_TO_MAP`),
   `dense_init.backend: da3` (intrinsics-conditioned; extrinsics off — DA3's
   Umeyama pose alignment is degenerate for single-image calls; DAv2 fallback

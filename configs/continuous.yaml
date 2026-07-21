@@ -239,6 +239,12 @@ dense_init:
   # prune. Raise if newcomers get pruned before they're observed enough.
   grace_iters: 20
 
+  # Cap on the viewer's lightweight dense preview cloud (dense.ply =
+  # accumulated DA3 dense + current sparse points). Above this the dense
+  # points are uniformly subsampled so the cloud stays fast to fetch, kept
+  # separate from the heavy splat set (latest.ply). 0 disables the cap.
+  preview_max_points: 100000
+
   persist_model: false
 
   # Depth-Anything-V2 model config.

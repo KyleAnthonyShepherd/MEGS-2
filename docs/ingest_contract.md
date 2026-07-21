@@ -81,16 +81,28 @@ no-op on values.
 so the server/overlays can show which side owns the GPU. The home-server
 polls this (cached 3 s) and surfaces it in its session status.
 
-## Splat export
+## Export: two viewer layers per session
 
-When started with `--export_dir` (or `$TRAINER_EXPORT_DIR`), every snapshot
-write also atomically mirrors to `<export_dir>/<session_id>/latest.ply` —
-the path the home-server's `latest_splat_ply()` serves to the viewer.
+When started with `--export_dir` (or `$TRAINER_EXPORT_DIR`), on each ingest —
+right after dense-init seeds the new camera and *before* any training
+iterations — the trainer writes **two separate artifacts** into
+`<export_dir>/<session_id>/`, so the newly added camera shows up within a
+second of the `/ingest` (viewer step 4), not only at convergence:
 
-**Early dense snapshot:** on each ingest, right after dense-init seeds the new
-camera and *before* any training iterations, the trainer writes a snapshot.
-So `latest.ply` reflects the newly added camera within a second of the
-`/ingest` (viewer step 4), not only at convergence.
+- **`latest.ply`** — the heavy Gaussian **splat** model (`save_ply`), the
+  path `latest_splat_ply()` serves to the WebGL "view splats" layer.
+- **`dense.ply`** — a lightweight **point cloud**: the accumulated DA3 dense
+  seed points plus the current sparse SfM points. Plain binary PLY, one
+  `vertex` element with `float x,y,z` + `uchar red,green,blue` — *not* the
+  Gaussian model. This is the viewer's fast "dense cloud" layer, distinct
+  from the splats; it's kept small (uniformly subsampled to
+  `dense_init.preview_max_points`, default 100k) and in the **raw
+  reconstruction frame** (the server gravity-aligns it). Writing only
+  `latest.ply` would leave the server's `dense_available` toggle off while
+  the WebGL splats still work.
+
+Both writes are atomic (tmp + `os.replace`). The server's `/status` gates the
+two layers independently via `dense_available` / `splats_available`.
 
 ## Bootstrap & dense init
 
