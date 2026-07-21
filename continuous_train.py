@@ -155,6 +155,12 @@ class DenseInitConfig:
     max_rejected_fraction: float = 0.5
     grace_iters: int = 20
     persist_model: bool = False
+    # Cap on the viewer's lightweight dense preview cloud (dense.ply =
+    # accumulated DA3 dense + current sparse points). When the accumulated
+    # dense points exceed this, they're uniformly subsampled so the cloud
+    # stays small/fast to fetch (the heavy splat set lives in latest.ply).
+    # 0 disables the cap.
+    preview_max_points: int = 100_000
     dav2: DAv2Config = field(default_factory=DAv2Config)
     da3: DA3Config = field(default_factory=DA3Config)
     ransac: RansacConfig = field(default_factory=RansacConfig)
@@ -440,7 +446,7 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
             _run_cameras(depth_model, new_cams, "dav2")
 
     if not accumulated_xyz:
-        return
+        return None
 
     all_xyz = np.concatenate(accumulated_xyz, axis=0)
     all_rgb = np.concatenate(accumulated_rgb, axis=0)
@@ -457,7 +463,7 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
 
     n_novel = int(novel_mask.sum())
     if n_novel == 0:
-        return
+        return None
 
     novel_xyz = all_xyz[novel_mask]
     novel_rgb = all_rgb[novel_mask]
@@ -466,7 +472,7 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
         capacity = max_gaussians - gaussians.get_xyz.shape[0]
         if capacity <= 0:
             logger.warning("[dense-init] already at capacity — skipping")
-            return
+            return None
         if n_novel > capacity:
             rng = np.random.default_rng(0)
             keep = rng.choice(n_novel, size=capacity, replace=False)
@@ -490,6 +496,11 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
     )
     elapsed = time.monotonic() - t_start
     logger.info(f"[dense-init] added {n_novel} dense Gaussians; wall={elapsed:.1f}s")
+
+    # Return the seeded dense points (world frame, rgb in [0, 1]) so the loop
+    # can accumulate them into the viewer's lightweight dense preview cloud
+    # (dense.ply), separate from the heavy splat model.
+    return novel_xyz, novel_rgb
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +605,58 @@ def write_snapshot_atomic(model_path: str, gaussians: SphericalGaussianModel,
     return str(final)
 
 
+def subsample_points(xyz: "np.ndarray", rgb: "np.ndarray",
+                     max_points: int, seed: int = 0):
+    """Uniformly subsample (xyz, rgb) to at most ``max_points`` points,
+    deterministically. ``max_points <= 0`` (or already under it) returns the
+    inputs unchanged. Keeps xyz/rgb row-aligned and preserves order."""
+    if max_points and xyz is not None and len(xyz) > max_points:
+        rng = np.random.default_rng(seed)
+        keep = np.sort(rng.choice(len(xyz), size=max_points, replace=False))
+        return xyz[keep], rgb[keep]
+    return xyz, rgb
+
+
+def write_dense_cloud_atomic(export_dir: Optional[str], session_id: Optional[str],
+                             xyz: "np.ndarray", rgb: "np.ndarray") -> Optional[str]:
+    """Atomically write the viewer's lightweight dense point cloud to
+    <export_dir>/<session_id>/dense.ply.
+
+    Binary PLY, single ``vertex`` element: ``float x,y,z`` + ``uchar
+    red,green,blue`` — a plain point cloud (the accumulated DA3 dense + sparse
+    seed points), distinct from the heavy Gaussian splat model in latest.ply.
+    Kept in the raw reconstruction frame (the home-server viewer gravity-aligns
+    it). ``rgb`` is accepted either as [0, 1] floats or 0–255 values. No-op
+    (returns None) without export_dir/session_id or with no points."""
+    from plyfile import PlyData, PlyElement
+
+    if not (export_dir and session_id):
+        return None
+    if xyz is None or len(xyz) == 0:
+        return None
+
+    xyz = np.ascontiguousarray(xyz, dtype=np.float32)
+    rgb = np.asarray(rgb, dtype=np.float32)
+    if rgb.max(initial=0.0) <= 1.0:
+        rgb = rgb * 255.0
+    rgb = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+    verts = np.empty(len(xyz), dtype=[
+        ("x", "f4"), ("y", "f4"), ("z", "f4"),
+        ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+    ])
+    verts["x"], verts["y"], verts["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    verts["red"], verts["green"], verts["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+
+    exp_dir = Path(export_dir) / session_id
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = exp_dir / "dense.ply.tmp"
+    final = exp_dir / "dense.ply"
+    PlyData([PlyElement.describe(verts, "vertex")], text=False).write(str(tmp))
+    os.replace(str(tmp), str(final))
+    return str(final)
+
+
 # ---------------------------------------------------------------------------
 # Train-state checkpoint (crash resilience / --resume)
 # ---------------------------------------------------------------------------
@@ -687,6 +750,45 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
 
     last_snapshot_dir = None
     evlog = EventLog(os.path.join(model_path, "events.jsonl"))
+
+    # Accumulated DA3 dense seed points (world frame, rgb [0,1]) for the
+    # viewer's lightweight dense preview cloud (dense.ply). Bounded by
+    # preview_max_points; the current sparse cloud is added at write time.
+    dense_cloud_xyz: Optional[np.ndarray] = None
+    dense_cloud_rgb: Optional[np.ndarray] = None
+
+    def accumulate_dense_points(new_xyz, new_rgb):
+        nonlocal dense_cloud_xyz, dense_cloud_rgb
+        if new_xyz is None or len(new_xyz) == 0:
+            return
+        if dense_cloud_xyz is None:
+            dense_cloud_xyz, dense_cloud_rgb = new_xyz, new_rgb
+        else:
+            dense_cloud_xyz = np.concatenate([dense_cloud_xyz, new_xyz], axis=0)
+            dense_cloud_rgb = np.concatenate([dense_cloud_rgb, new_rgb], axis=0)
+        # Keep the accumulator bounded so dense.ply stays small/fast.
+        dense_cloud_xyz, dense_cloud_rgb = subsample_points(
+            dense_cloud_xyz, dense_cloud_rgb,
+            getattr(cfg.dense_init, "preview_max_points", 0) or 0)
+
+    def write_dense_preview():
+        """dense.ply = current sparse cloud + accumulated DA3 dense points."""
+        pcd = prog_scene.current_basic_pcd
+        parts_xyz, parts_rgb = [], []
+        if pcd is not None and len(pcd.points) > 0:
+            parts_xyz.append(np.asarray(pcd.points, dtype=np.float32))
+            parts_rgb.append(np.asarray(pcd.colors, dtype=np.float32))
+        if dense_cloud_xyz is not None and len(dense_cloud_xyz) > 0:
+            parts_xyz.append(dense_cloud_xyz)
+            parts_rgb.append(dense_cloud_rgb)
+        if not parts_xyz:
+            return
+        xyz = np.concatenate(parts_xyz, axis=0)
+        rgb = np.concatenate(parts_rgb, axis=0)
+        path = write_dense_cloud_atomic(export_dir, ctrl.session_id, xyz, rgb)
+        if path is not None:
+            evlog.emit("dense_cloud", iter=global_iter, path=path,
+                       n_points=int(len(xyz)))
 
     def trainer_state_dict():
         return {
@@ -845,17 +947,21 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
 
             # Dense init for each newly ingested image
             if cfg.dense_init.enabled and new_cams:
-                dense_init_for_new_images(
+                seeded = dense_init_for_new_images(
                     gaussians, prog_scene, new_cams,
                     cfg.dense_init, opt, current_iter=global_iter,
                     dav2_model=_persistent_dav2,
                     max_gaussians=tc.num_max_ceiling,
                 )
+                if seeded is not None:
+                    accumulate_dense_points(*seeded)
 
-            # Early dense snapshot (MEGS-2 ingest contract §8): mirror the
-            # DA3-seeded cloud to the viewer's latest.ply *now*, so the new
-            # camera shows up within a second of ingest — before we spend any
-            # training iterations on it. Cheap next to the COLMAP cycle.
+            # Early snapshots (MEGS-2 ingest contract §8): reflect the new
+            # camera *now*, before any training iterations. Two separate
+            # artifacts for the viewer's two layers:
+            #   latest.ply — the heavy Gaussian splat model (WebGL "splats").
+            #   dense.ply  — a lightweight xyz+rgb point cloud (DA3 dense +
+            #                sparse seed points), the fast "dense cloud".
             if gaussians._xyz_cohorts:
                 snap = write_snapshot_atomic(
                     model_path, gaussians, export_dir, ctrl.session_id)
@@ -863,6 +969,7 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                            session_id=req.session_id,
                            image_name=req.image_name,
                            splat_count=gaussians.num_primitives)
+            write_dense_preview()
 
             # Parse match matrix if available
             matrix_path = prog_scene.snapshot_dir / "sparse/0/imageMatchMatrix.txt"
