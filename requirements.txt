@@ -4,3 +4,18 @@ submodules/diff-gaussian-rasterization
 submodules/diff-gaussian-rasterization_ms
 submodules/diff-gaussian-rasterization_ms_light
 submodules/simple-knn
+
+# Depth Anything 3 — required by dense_init.backend: da3 (the default).
+# DELIBERATELY NOT INSTALLED BY THIS FILE. The package declares numpy<2 and
+# pulls xformers, open3d, pycolmap and moviepy; a plain `pip install
+# depth-anything-3` into a venv that already has a working torch + CUDA
+# submodules will downgrade numpy and can drag torch with it. Install the
+# api-path dependencies only:
+#
+#   pip install --no-deps depth-anything-3
+#   pip install einops addict omegaconf evo safetensors plyfile trimesh #               opencv-python "moviepy==1.0.3" imageio imageio-ffmpeg
+#   python -c "import depth_anything_3.api"    # must import cleanly
+#
+# If that import dies on pycolmap's C++ backend (it does on Windows), only
+# export_to_colmap needs it — stub it before importing:
+#   sys.modules.setdefault("pycolmap", types.ModuleType("pycolmap"))

@@ -76,6 +76,10 @@ class ProgressiveScene:
         # Point track info: point_id (int) → list of colmap image_ids
         self._point_track_info: Dict[int, List[int]] = {}
         self._current_sfm_xyz: Optional[np.ndarray] = None
+        # Per-point COLMAP reprojection error, row-aligned with
+        # _current_sfm_xyz. Used by the Plan 6a §5.1 registration gate
+        # to spot badly-placed cameras before they poison a DA3 window.
+        self._current_sfm_errors: Optional[np.ndarray] = None
         self._current_sfm_point_ids: Optional[List[int]] = None
 
         # Mapping from COLMAP image_id → index in train_cameras
@@ -134,12 +138,12 @@ class ProgressiveScene:
         bin_path = os.path.join(snap_path, "sparse/0", "points3D.bin")
         txt_path = os.path.join(snap_path, "sparse/0", "points3D.txt")
         try:
-            xyzs, rgbs, _, point_ids, track_image_ids = \
+            xyzs, rgbs, errors, point_ids, track_image_ids = \
                 read_points3D_binary_with_tracks(bin_path)
         except FileNotFoundError:
             # Fall back: read txt (no track info)
             from scene.colmap_loader import read_points3D_text
-            xyzs, rgbs, _ = read_points3D_text(txt_path)
+            xyzs, rgbs, errors = read_points3D_text(txt_path)
             point_ids = list(range(len(xyzs)))
             track_image_ids = [[] for _ in xyzs]
 
@@ -150,6 +154,7 @@ class ProgressiveScene:
         )
 
         self._current_sfm_xyz = xyzs
+        self._current_sfm_errors = np.asarray(errors).reshape(-1)
         self._current_sfm_point_ids = point_ids
         # Rebuild track info dict (overwrite; latest snapshot is ground truth)
         self._point_track_info = {}
@@ -252,11 +257,11 @@ class ProgressiveScene:
         bin_path = os.path.join(snap_path, "sparse/0", "points3D.bin")
         txt_path = os.path.join(snap_path, "sparse/0", "points3D.txt")
         try:
-            xyzs, rgbs, _, point_ids, track_image_ids = \
+            xyzs, rgbs, errors, point_ids, track_image_ids = \
                 read_points3D_binary_with_tracks(bin_path)
         except FileNotFoundError:
             from scene.colmap_loader import read_points3D_text
-            xyzs, rgbs, _ = read_points3D_text(txt_path)
+            xyzs, rgbs, errors = read_points3D_text(txt_path)
             point_ids = list(range(len(xyzs)))
             track_image_ids = [[] for _ in xyzs]
 
@@ -267,6 +272,7 @@ class ProgressiveScene:
         )
 
         self._current_sfm_xyz = xyzs
+        self._current_sfm_errors = np.asarray(errors).reshape(-1)
         self._current_sfm_point_ids = point_ids
         self._point_track_info = {}
         for pid, img_ids in zip(point_ids, track_image_ids):

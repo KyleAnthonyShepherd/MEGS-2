@@ -1,9 +1,22 @@
 """Dense initialization via Depth Anything v2.
 
-Three public entry points:
+Single-image path:
   DepthAnythingV2Wrapper  — context manager: loads DAv2 on __enter__, frees on __exit__
   align_depth_to_sfm      — RANSAC alignment of DAv2 depth to SfM ground-truth depths
   depth_to_points         — back-project aligned depth map to world-space point cloud
+
+Multi-view window path (Plan 6a; see scene/covisibility.py for which images go
+into each window):
+  DepthAnything3Wrapper.predict_batch — one DA3 call over a window, anchor first
+  normalize_window_extrinsics — §8 pose pre-normalisation, undone on the depth
+  cross_view_consistency      — §6 per-pixel agreement count across the window
+  window_scale_residual /
+    resolve_scale_residual    — §9 one-scalar residual check against the SfM points
+  depth_to_points_masked      — back-project the pixels the window kept
+  fit_depth_to_reference /
+    ReferenceFit              — incremental scale+offset alignment of a new
+                                window onto the dense cloud already built from
+                                the earlier images
 
 Landmine notes:
   DL1: Camera FoVx/FoVy are in radians → fx = W/(2*tan(FoVx/2))
@@ -69,6 +82,18 @@ class DA3Config:
     # in that path; keep this OFF until a multi-view batch path exists.
     condition_extrinsics: bool = False
     use_ray_pose: bool = False
+    # Multi-view window landmines (Plan 6a §8).
+    # DA3 defaults to "saddle_balanced", which *reorders views*. We keep the
+    # anchor at index 0 and read depths[0] back, so the reference view must be
+    # the first one.
+    ref_view_strategy: str = "first"
+    # _normalize_extrinsics clamps the median camera distance at 0.1
+    # (api.py:333). COLMAP scale is arbitrary, so a session whose inter-camera
+    # spacing lands below that clamp would be silently mis-normalised. Divide
+    # the translations by the window's own median camera-centre distance and
+    # undo it on the returned depth. align_to_input_ext_scale should make this
+    # a no-op — that is a prediction, not an observation (Plan 6a §12).
+    prenormalize_extrinsics: bool = True
 
 
 @dataclass
@@ -272,6 +297,107 @@ class DepthAnything3Wrapper:
         return depth.cpu()
 
 
+    def predict_batch(self, images_chw, cameras):
+        """One DA3 multi-view pass over a Plan 6a window. Anchor is index 0.
+
+        Every depth map in the returned list shares one scale fit: they come
+        from a single inference() call, so the per-pixel consistency check in
+        cross_view_consistency() is comparing like with like. An image's depth
+        must never be stitched from more than one call (Plan 6a §1.3).
+
+        Args:
+            images_chw: list of (3, H, W) float tensors in [0, 1]; index 0 is
+                the anchor, whose depth map is the one we keep.
+            cameras: matching list of MEGS-2 Cameras, same order.
+
+        Returns:
+            (depths, confs) — lists of (H_i, W_i) float32 CPU tensors, each
+            resized back to its own input resolution and in COLMAP depth units.
+            confs is a list of None when the model exposes no confidence head.
+        """
+        import torch as _torch
+
+        if len(images_chw) != len(cameras):
+            raise ValueError(
+                f"predict_batch: {len(images_chw)} images vs "
+                f"{len(cameras)} cameras")
+        if len(images_chw) < 2:
+            raise ValueError(
+                "predict_batch needs >= 2 views; DA3's Umeyama pose alignment "
+                "is rank-degenerate on a single view")
+
+        imgs = [(im.cpu().float().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                for im in images_chw]
+        ext = np.concatenate(
+            [_get_w2c(c).astype(np.float64)[None] for c in cameras], axis=0)
+        ixt = np.stack([_intrinsic_matrix(c) for c in cameras]).astype(np.float32)
+
+        # §8: pre-normalise defensively against api.py:333's 0.1 clamp.
+        scale = 1.0
+        if self.cfg.prenormalize_extrinsics:
+            ext, scale = normalize_window_extrinsics(ext)
+
+        kwargs = {
+            "intrinsics": ixt,
+            "extrinsics": ext.astype(np.float32),
+            "align_to_input_ext_scale": True,
+            "ref_view_strategy": self.cfg.ref_view_strategy,
+            "process_res": self.cfg.process_res,
+        }
+        if self.cfg.use_ray_pose:
+            kwargs["use_ray_pose"] = True
+
+        with _torch.no_grad():
+            prediction = self.model.inference(imgs, **kwargs)
+
+        raw_depth = np.asarray(prediction.depth)
+        if len(raw_depth) != len(imgs):
+            raise RuntimeError(
+                f"DA3 returned {len(raw_depth)} depth maps for {len(imgs)} "
+                "views — the window's index mapping is not identity")
+        self._warn_if_views_reordered(prediction)
+
+        raw_conf = None
+        for attr in ("conf", "confidence", "conf_map"):
+            if getattr(prediction, attr, None) is not None:
+                raw_conf = np.asarray(getattr(prediction, attr))
+                break
+
+        depths, confs = [], []
+        for k, image_chw in enumerate(images_chw):
+            H, W = int(image_chw.shape[1]), int(image_chw.shape[2])
+            d = _torch.as_tensor(raw_depth[k], dtype=_torch.float32)
+            d = _torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+            depths.append(_resize_map(d, H, W) * float(scale))
+            if raw_conf is None:
+                confs.append(None)
+            else:
+                c = _torch.as_tensor(raw_conf[k], dtype=_torch.float32)
+                c = _torch.nan_to_num(c, nan=0.0, posinf=0.0, neginf=0.0)
+                confs.append(_resize_map(c, H, W))
+        return depths, confs
+
+    def _warn_if_views_reordered(self, prediction):
+        """Plan 6a §8 asks us to verify the identity mapping anyway."""
+        for attr in ("view_order", "view_indices", "input_order"):
+            order = getattr(prediction, attr, None)
+            if order is None:
+                continue
+            order = [int(v) for v in np.asarray(order).reshape(-1)]
+            if order != list(range(len(order))):
+                logger.warning(
+                    "[dense-init] DA3 reordered views (%s=%s) despite "
+                    "ref_view_strategy=%r — depths[0] is NOT the anchor",
+                    attr, order, self.cfg.ref_view_strategy)
+            return
+        ref = getattr(prediction, "ref_view_index", None)
+        if ref is not None and int(ref) != 0:
+            logger.warning(
+                "[dense-init] DA3 chose reference view %d, not the anchor; "
+                "ref_view_strategy=%r did not take", int(ref),
+                self.cfg.ref_view_strategy)
+
+
 def camera_to_da3_conditioning(camera):
     """Build DA3 conditioning arrays from a MEGS-2 Camera.
 
@@ -280,10 +406,7 @@ def camera_to_da3_conditioning(camera):
     (DL3) and DA3 use.
     """
     ext = _get_w2c(camera).astype(np.float32)[None]
-    fx, fy, cx, cy = _get_camera_intrinsics(camera)
-    ixt = np.array([[fx, 0.0, cx],
-                    [0.0, fy, cy],
-                    [0.0, 0.0, 1.0]], dtype=np.float32)[None]
+    ixt = _intrinsic_matrix(camera).astype(np.float32)[None]
     return ext, ixt
 
 
@@ -538,3 +661,515 @@ def depth_to_points(
     rgb_sel = img_np[v_int, u_int, :].astype(np.float32)   # (M, 3)
 
     return p_world, rgb_sel
+
+
+# ---------------------------------------------------------------------------
+# Multi-view windows (Plan 6a) — §6 consistency, §8 normalisation, §9 residual
+#
+# Everything below is pure numpy over data already in RAM and is testable
+# without a GPU; only DepthAnything3Wrapper.predict_batch needs the model.
+# ---------------------------------------------------------------------------
+
+def _intrinsic_matrix(camera) -> np.ndarray:
+    """(3, 3) float64 pinhole intrinsics for a MEGS-2 Camera."""
+    fx, fy, cx, cy = _get_camera_intrinsics(camera)
+    return np.array([[fx, 0.0, cx],
+                     [0.0, fy, cy],
+                     [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _resize_map(tensor_hw, H: int, W: int):
+    """Bilinearly resize a (h, w) torch map to (H, W); no-op when it matches."""
+    import torch as _torch
+    if tuple(tensor_hw.shape) == (H, W):
+        return tensor_hw.cpu()
+    return _torch.nn.functional.interpolate(
+        tensor_hw.unsqueeze(0).unsqueeze(0), size=(H, W),
+        mode="bilinear", align_corners=False,
+    ).squeeze(0).squeeze(0).cpu()
+
+
+def camera_world_center(camera) -> np.ndarray:
+    """World-space camera centre: c = -R^T t (DL3)."""
+    w2c = _get_w2c(camera)
+    return -w2c[:3, :3].T @ w2c[:3, 3]
+
+
+def normalize_window_extrinsics(ext: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Plan 6a §8 — rescale a window's translations to unit median baseline.
+
+    DA3's `_normalize_extrinsics` clamps the median camera distance at 0.1
+    (api.py:333). COLMAP's scale is arbitrary, so a session whose inter-camera
+    spacing falls under that clamp gets silently mis-normalised. We divide the
+    world by the window's own median camera-centre distance before handing the
+    poses over, and multiply the returned depth back by the same scalar.
+
+    Args:
+        ext: (N, 4, 4) world-to-camera matrices, anchor at index 0.
+
+    Returns:
+        (ext_scaled, scale) — `ext_scaled` has t/scale, R untouched; multiply
+        DA3's returned depths by `scale` to get back to COLMAP units.
+    """
+    ext = np.asarray(ext, dtype=np.float64)
+    if ext.ndim != 3 or ext.shape[1:] != (4, 4):
+        raise ValueError(f"expected (N, 4, 4) extrinsics, got {ext.shape}")
+
+    centers = np.stack([-e[:3, :3].T @ e[:3, 3] for e in ext])
+    dists = np.linalg.norm(centers[1:] - centers[0], axis=1)
+    dists = dists[np.isfinite(dists) & (dists > 0)]
+    scale = float(np.median(dists)) if len(dists) else 1.0
+    if not np.isfinite(scale) or scale <= 0:
+        # Every camera at the same centre: a pure rotation. Leave the poses
+        # alone — select_window should already have flagged this window
+        # degenerate (§5.5), and a bogus scale would only hide it.
+        return ext.copy(), 1.0
+
+    scaled = ext.copy()
+    scaled[:, :3, 3] /= scale
+    return scaled, scale
+
+
+def bilinear_sample(image_hw: np.ndarray, u: np.ndarray,
+                    v: np.ndarray) -> np.ndarray:
+    """Sample a (H, W) map at float pixel coords. Out of bounds -> NaN."""
+    img = np.asarray(image_hw, dtype=np.float64)
+    H, W = img.shape
+    u = np.asarray(u, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+
+    inside = np.isfinite(u) & np.isfinite(v) & (u >= 0) & (u <= W - 1) \
+        & (v >= 0) & (v <= H - 1)
+    us = np.where(inside, u, 0.0)
+    vs = np.where(inside, v, 0.0)
+
+    u0 = np.floor(us).astype(np.int64)
+    v0 = np.floor(vs).astype(np.int64)
+    u1 = np.minimum(u0 + 1, W - 1)
+    v1 = np.minimum(v0 + 1, H - 1)
+    du = us - u0
+    dv = vs - v0
+
+    out = (img[v0, u0] * (1 - du) * (1 - dv)
+           + img[v0, u1] * du * (1 - dv)
+           + img[v1, u0] * (1 - du) * dv
+           + img[v1, u1] * du * dv)
+    return np.where(inside, out, np.nan)
+
+
+def cross_view_consistency(
+    depths,
+    cameras,
+    reproj_px_threshold: float = 1.5,
+    depth_rel_threshold: float = 0.01,
+) -> np.ndarray:
+    """Plan 6a §6 — how many neighbours agree with each anchor pixel.
+
+    This is the frustum-intersection count the plan set out to compute, done
+    per pixel by reprojection instead of analytically as polyhedra: it counts
+    the cameras that contain the point *and* see it unoccluded, because an
+    anchor pixel occluded in view j reprojects onto a different surface and
+    fails the round trip.
+
+    All depth maps must come from one DA3 call, so they share a scale.
+
+    Args:
+        depths: list of (H_i, W_i) depth maps (numpy or torch); index 0 is the
+            anchor, whose grid the result is on.
+        cameras: matching MEGS-2 Cameras, same order.
+        reproj_px_threshold: step 5's ||p - p'|| limit, anchor pixels.
+        depth_rel_threshold: step 5's |d_j - z_j| / z_j limit.
+
+    Returns:
+        (H, W) int32 count of agreeing neighbours; 0 wherever the anchor's own
+        depth is non-positive or non-finite.
+    """
+    def _np(d):
+        return np.asarray(d.cpu().numpy() if hasattr(d, "cpu") else d,
+                          dtype=np.float64)
+
+    anchor_depth = _np(depths[0])
+    H, W = anchor_depth.shape
+    n_consistent = np.zeros((H, W), dtype=np.int32)
+    valid_anchor = np.isfinite(anchor_depth) & (anchor_depth > 0)
+    if not valid_anchor.any() or len(depths) < 2:
+        return n_consistent
+
+    fx, fy, cx, cy = _get_camera_intrinsics(cameras[0])
+    w2c_a = _get_w2c(cameras[0])
+    R_a, t_a = w2c_a[:3, :3], w2c_a[:3, 3]
+
+    u_grid, v_grid = np.meshgrid(np.arange(W, dtype=np.float64),
+                                 np.arange(H, dtype=np.float64))
+    u_flat, v_flat = u_grid.reshape(-1), v_grid.reshape(-1)
+    d_flat = np.where(valid_anchor, anchor_depth, 1.0).reshape(-1)
+
+    # 1. Back-project every anchor pixel to a world point.
+    p_cam = np.stack([(u_flat - cx) * d_flat / fx,
+                      (v_flat - cy) * d_flat / fy,
+                      d_flat], axis=1)
+    X = (R_a.T @ (p_cam - t_a).T).T
+
+    agree_any = np.zeros(H * W, dtype=np.int32)
+    for j in range(1, len(depths)):
+        depth_j = _np(depths[j])
+        H_j, W_j = depth_j.shape
+        fxj, fyj, cxj, cyj = _get_camera_intrinsics(cameras[j])
+        w2c_j = _get_w2c(cameras[j])
+        R_j, t_j = w2c_j[:3, :3], w2c_j[:3, 3]
+
+        # 2. Project into neighbour j -> pixel p_j, expected depth z_j.
+        p_j = (R_j @ X.T).T + t_j
+        z_j = p_j[:, 2]
+        front = z_j > 1e-9
+        safe_z = np.where(front, z_j, 1.0)
+        u_j = fxj * p_j[:, 0] / safe_z + cxj
+        v_j = fyj * p_j[:, 1] / safe_z + cyj
+
+        # 3. Read j's own depth there.
+        d_j = bilinear_sample(depth_j, u_j, v_j)
+        good = front & np.isfinite(d_j) & (d_j > 0)
+        d_safe = np.where(good, d_j, 1.0)
+
+        # 4. Back-project p_j with d_j and reproject into the anchor.
+        p_back = np.stack([(u_j - cxj) * d_safe / fxj,
+                           (v_j - cyj) * d_safe / fyj,
+                           d_safe], axis=1)
+        X_back = (R_j.T @ (p_back - t_j).T).T
+        p_a = (R_a @ X_back.T).T + t_a
+        z_a = p_a[:, 2]
+        front_a = z_a > 1e-9
+        safe_za = np.where(front_a, z_a, 1.0)
+        u_back = fx * p_a[:, 0] / safe_za + cx
+        v_back = fy * p_a[:, 1] / safe_za + cy
+
+        # 5. Agree iff the round trip lands back on the same pixel AND the
+        #    neighbour's depth matches the depth we expected there.
+        reproj_err = np.hypot(u_back - u_flat, v_back - v_flat)
+        rel_depth_err = np.abs(d_safe - z_j) / np.maximum(np.abs(z_j), 1e-12)
+        agree = (good & front_a
+                 & (reproj_err < reproj_px_threshold)
+                 & (rel_depth_err < depth_rel_threshold))
+        agree_any += agree.astype(np.int32)
+
+    n_consistent = agree_any.reshape(H, W)
+    n_consistent[~valid_anchor] = 0
+    return n_consistent
+
+
+# ---------------------------------------------------------------------------
+# §9 — per-window scale residual against the SfM points
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScaleResidual:
+    """Outcome of the §9 check. `action` is accept | rescale | reject."""
+
+    r: float
+    n_points: int
+    action: str
+    factor: float          # multiply the window's depth by this
+    reason: str = ""
+
+
+def window_scale_residual(
+    depth_map,
+    camera,
+    sfm_xyz_visible: np.ndarray,
+) -> Tuple[float, int]:
+    """r = median(DA3_depth(p) / SfM_depth(p)) over SfM points seen by `camera`.
+
+    Note this uses the SfM points as a residual check on *one scalar*, not as
+    the alignment mechanism — the affine a*d+b fit is gone in the window path.
+
+    Returns (r, n_points_used); r is NaN when nothing usable projected.
+    """
+    depth = np.asarray(depth_map.cpu().numpy()
+                       if hasattr(depth_map, "cpu") else depth_map,
+                       dtype=np.float64)
+    H, W = depth.shape
+    if sfm_xyz_visible is None or len(sfm_xyz_visible) == 0:
+        return float("nan"), 0
+
+    u, v, z_sfm = project_world_to_image(sfm_xyz_visible, camera)
+    inside = (z_sfm > 1e-6) & (u >= 0) & (u <= W - 1) & (v >= 0) & (v <= H - 1)
+    if not inside.any():
+        return float("nan"), 0
+
+    d_pred = bilinear_sample(depth, u[inside], v[inside])
+    z = z_sfm[inside]
+    ok = np.isfinite(d_pred) & (d_pred > 0)
+    if not ok.any():
+        return float("nan"), 0
+    ratios = d_pred[ok] / z[ok]
+    return float(np.median(ratios)), int(ok.sum())
+
+
+def resolve_scale_residual(r: float, n_points: int, cfg) -> ScaleResidual:
+    """Turn a residual into accept / rescale / reject (Plan 6a §9).
+
+    `cfg` is a MultiViewConfig (residual_* fields).
+    """
+    if not np.isfinite(r) or n_points < cfg.residual_min_points:
+        return ScaleResidual(
+            r, n_points, "reject", 1.0,
+            f"only {n_points} SfM points to check scale against "
+            f"(need {cfg.residual_min_points})")
+    if r < cfg.residual_reject_low or r > cfg.residual_reject_high:
+        return ScaleResidual(
+            r, n_points, "reject", 1.0,
+            f"depth/SfM ratio {r:.3f} outside "
+            f"[{cfg.residual_reject_low}, {cfg.residual_reject_high}]")
+    if abs(r - 1.0) <= cfg.residual_accept_tolerance:
+        return ScaleResidual(r, n_points, "accept", 1.0)
+    return ScaleResidual(
+        r, n_points, "rescale", 1.0 / r,
+        f"depth/SfM ratio {r:.3f}; applying scalar {1.0 / r:.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Back-projection with an explicit keep mask (window path)
+# ---------------------------------------------------------------------------
+
+def depth_to_points_masked(
+    depth_map,
+    camera,
+    keep_mask: np.ndarray,
+    image_rgb,
+    target_n_points: int,
+    weights: Optional[np.ndarray] = None,
+    rng_seed: int = 0,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Back-project the pixels `keep_mask` selects, no affine fit involved.
+
+    The window path has already decided which pixels to trust (§6 consistency
+    x DA3 confidence x the §9 scale check), so unlike depth_to_points this does
+    no SfM-nearest-neighbour sanity filtering of its own.
+
+    Returns (xyz, rgb, weight) each length M, or None if nothing survives.
+    """
+    depth = np.asarray(depth_map.cpu().numpy()
+                       if hasattr(depth_map, "cpu") else depth_map,
+                       dtype=np.float64)
+    H, W = depth.shape
+    fx, fy, cx, cy = _get_camera_intrinsics(camera)
+
+    keep = np.asarray(keep_mask, dtype=bool).reshape(-1)
+    d_flat = depth.reshape(-1)
+    keep &= np.isfinite(d_flat) & (d_flat > 0.01)
+    n_keep = int(keep.sum())
+    if n_keep == 0:
+        return None
+
+    idx = np.where(keep)[0]
+    if target_n_points > 0 and n_keep > target_n_points:
+        rng = np.random.default_rng(rng_seed)
+        idx = np.sort(rng.choice(idx, size=target_n_points, replace=False))
+
+    u_sel = (idx % W).astype(np.float64)
+    v_sel = (idx // W).astype(np.float64)
+    d_sel = d_flat[idx]
+
+    p_cam = np.stack([(u_sel - cx) * d_sel / fx,
+                      (v_sel - cy) * d_sel / fy,
+                      d_sel], axis=1)
+    w2c = _get_w2c(camera)
+    R, t = w2c[:3, :3], w2c[:3, 3]
+    p_world = (R.T @ (p_cam - t).T).T.astype(np.float32)
+
+    img_np = (image_rgb.cpu().float().permute(1, 2, 0).numpy()
+              if hasattr(image_rgb, "cpu") else np.asarray(image_rgb))
+    rgb_sel = img_np[v_sel.astype(int), u_sel.astype(int), :].astype(np.float32)
+
+    if weights is None:
+        w_sel = np.ones(len(idx), dtype=np.float32)
+    else:
+        w_sel = np.asarray(weights, dtype=np.float32).reshape(-1)[idx]
+
+    return p_world, rgb_sel, w_sel
+
+
+# ---------------------------------------------------------------------------
+# Incremental alignment to the dense cloud already on the ground
+#
+# Plan 6a §9 corrects a window by one scalar fitted to the SfM points. Measured
+# on sessions/30d37bfd that is the wrong target: the sparse, textured SfM points
+# do not represent the dense surface, so r estimates a scale the dense pixels do
+# not have — dividing it out barely helps and makes DA3-LARGE *worse*. What the
+# windows actually disagree on is a per-window AFFINE: a scale plus an origin
+# offset of 2-3% of depth, which reads as parallel sheets ("pancaking").
+#
+# So fit the new window against the geometry already reconstructed from the
+# earlier images, down the new camera's own rays, and keep the SfM residual as a
+# guard rather than the corrector. The first window has nothing to align to and
+# falls back to §9, which is what sets absolute scale for everything after it.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReferenceFit:
+    """Outcome of aligning one window's depth to the existing dense cloud."""
+
+    scale: float = 1.0
+    offset: float = 0.0
+    n_matched: int = 0
+    inlier_fraction: float = 0.0
+    ok: bool = False
+    reason: str = ""
+    # True when the reference depths spanned too little range to separate
+    # scale from offset, so only a scale was fitted.
+    scale_only: bool = False
+    depth_span: float = 0.0
+
+    def apply(self, depth):
+        """corrected = scale * depth + offset."""
+        return depth * self.scale + self.offset
+
+
+def reference_depth_buffer(camera, reference_xyz: np.ndarray, bin_px: int = 4):
+    """Nearest-surface depth of `reference_xyz` per coarse pixel bin.
+
+    Nearest, not median: a camera sees the closest surface down each ray, so
+    taking the minimum is what makes this occlusion-aware. Coarse bins because
+    the reference cloud is subsampled and will not hit every pixel.
+    """
+    xyz = np.asarray(reference_xyz, dtype=np.float64)
+    if xyz.ndim != 2 or len(xyz) == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0)
+
+    H, W = camera.image_height, camera.image_width
+    u, v, z = project_world_to_image(xyz, camera)
+    inside = (z > 1e-6) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    if not inside.any():
+        return np.zeros(0, dtype=np.int64), np.zeros(0)
+
+    nb = int(math.ceil(W / bin_px))
+    key = ((v[inside] // bin_px).astype(np.int64) * nb
+           + (u[inside] // bin_px).astype(np.int64))
+    z_in = z[inside]
+
+    order = np.lexsort((z_in, key))          # by cell, then nearest first
+    key, z_in = key[order], z_in[order]
+    first = np.r_[True, key[1:] != key[:-1]]
+    return key[first], z_in[first]
+
+
+def _huber_affine(x: np.ndarray, y: np.ndarray, delta: float,
+                  iters: int) -> Tuple[float, float, np.ndarray]:
+    """Robust y ~ s*x + c by IRLS with Huber weights. Returns (s, c, inliers)."""
+    s, c = 1.0, 0.0
+    w = np.ones_like(x)
+    for _ in range(max(1, iters)):
+        sw = np.sqrt(w)
+        A = np.stack([x * sw, sw], axis=1)
+        sol, *_ = np.linalg.lstsq(A, y * sw, rcond=None)
+        s, c = float(sol[0]), float(sol[1])
+        resid = np.abs(y - (s * x + c))
+        w = np.where(resid <= delta, 1.0, delta / np.maximum(resid, 1e-12))
+    return s, c, np.abs(y - (s * x + c)) <= delta
+
+
+def _huber_scale(x: np.ndarray, y: np.ndarray, delta: float,
+                 iters: int) -> Tuple[float, float, np.ndarray]:
+    """Robust y ~ s*x with no offset. Same IRLS, one parameter."""
+    s = 1.0
+    w = np.ones_like(x)
+    for _ in range(max(1, iters)):
+        denom = float(np.sum(w * x * x))
+        s = float(np.sum(w * x * y) / denom) if denom > 1e-12 else 1.0
+        resid = np.abs(y - s * x)
+        w = np.where(resid <= delta, 1.0, delta / np.maximum(resid, 1e-12))
+    return s, 0.0, np.abs(y - s * x) <= delta
+
+
+def fit_depth_to_reference(
+    depth_map,
+    camera,
+    reference_xyz: Optional[np.ndarray],
+    cfg,
+    valid_mask: Optional[np.ndarray] = None,
+) -> ReferenceFit:
+    """Fit `scale`/`offset` putting this window's depth onto the existing cloud.
+
+    Args:
+        depth_map: (H, W) anchor depth, DA3 units.
+        camera: the anchor camera.
+        reference_xyz: (N, 3) dense points from the images ingested so far.
+        cfg: MultiViewConfig (reference_* fields).
+        valid_mask: optional (H, W) bool of pixels worth matching — pass the
+            §6 consistency mask so the fit only sees depth we already trust.
+
+    A failed fit is not an error: it means this window is the first, or does not
+    overlap what is already there, and the caller falls back to §9.
+    """
+    fit = ReferenceFit()
+    if reference_xyz is None or len(reference_xyz) < cfg.reference_min_correspondences:
+        fit.reason = "no dense cloud to align to yet"
+        return fit
+
+    depth = np.asarray(depth_map.cpu().numpy() if hasattr(depth_map, "cpu")
+                       else depth_map, dtype=np.float64)
+    H, W = depth.shape
+    bin_px = max(1, int(cfg.reference_bin_px))
+
+    cells, z_ref = reference_depth_buffer(camera, reference_xyz, bin_px)
+    if len(cells) < cfg.reference_min_correspondences:
+        fit.reason = (f"only {len(cells)} reference cells project into "
+                      f"{getattr(camera, 'image_name', 'this view')}")
+        return fit
+
+    # Sample this window's own depth at the centre of each occupied cell.
+    nb = int(math.ceil(W / bin_px))
+    cu = (cells % nb) * bin_px + bin_px / 2.0
+    cv = (cells // nb) * bin_px + bin_px / 2.0
+    z_pred = bilinear_sample(depth, cu, cv)
+
+    good = np.isfinite(z_pred) & (z_pred > 0) & np.isfinite(z_ref) & (z_ref > 0)
+    if valid_mask is not None:
+        vm = np.asarray(valid_mask, dtype=bool)
+        ui = np.clip(cu.astype(int), 0, W - 1)
+        vi = np.clip(cv.astype(int), 0, H - 1)
+        good &= vm[vi, ui]
+    z_pred, z_ref = z_pred[good], z_ref[good]
+    if len(z_pred) < cfg.reference_min_correspondences:
+        fit.reason = (f"only {len(z_pred)} usable correspondences "
+                      f"(need {cfg.reference_min_correspondences})")
+        return fit
+
+    median_depth = float(np.median(z_ref))
+    delta = cfg.reference_huber_frac * median_depth
+
+    # Scale and offset are only separable over a real depth span. Looking at a
+    # fronto-parallel wall every z is the same, s*z+c is rank-deficient, and
+    # the solver returns an arbitrary (s, c) on the line s*z+c=z — which fits
+    # the observed depths perfectly and extrapolates disastrously outside them.
+    # Under that span, fit the scale alone.
+    span = float(z_ref.max() - z_ref.min())
+    span_ok = span >= cfg.reference_min_depth_span_frac * max(median_depth, 1e-9)
+    if span_ok:
+        scale, offset, inliers = _huber_affine(
+            z_pred, z_ref, delta, cfg.reference_iters)
+    else:
+        scale, offset, inliers = _huber_scale(
+            z_pred, z_ref, delta, cfg.reference_iters)
+    fit.scale_only = not span_ok
+    fit.depth_span = span
+
+    fit.scale, fit.offset = scale, offset
+    fit.n_matched = int(len(z_pred))
+    fit.inlier_fraction = float(inliers.mean())
+
+    if not (np.isfinite(scale) and np.isfinite(offset)):
+        fit.reason = "non-finite fit"
+    elif abs(scale - 1.0) > cfg.reference_max_scale_dev:
+        fit.reason = (f"scale {scale:.3f} deviates more than "
+                      f"{cfg.reference_max_scale_dev:.2f} from 1")
+    elif abs(offset) > cfg.reference_max_offset_frac * median_depth:
+        fit.reason = (f"offset {offset:.3f} exceeds "
+                      f"{cfg.reference_max_offset_frac:.0%} of median depth "
+                      f"{median_depth:.2f}")
+    elif fit.inlier_fraction < cfg.reference_min_inlier_fraction:
+        fit.reason = (f"only {fit.inlier_fraction:.0%} of correspondences are "
+                      f"inliers (need {cfg.reference_min_inlier_fraction:.0%})")
+    else:
+        fit.ok = True
+    return fit

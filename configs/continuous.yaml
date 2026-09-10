@@ -197,9 +197,16 @@ dense_init:
 
   # Depth Anything 3 settings (used when backend: da3).
   da3:
-    # HF repo id. DA3-SMALL is the 6 GB-safe start; DA3-BASE next;
-    # DA3MONO-LARGE / DA3METRIC-LARGE only after checking headroom.
-    model_name: "depth-anything/DA3-SMALL"
+    # HF repo id. Measured on sessions/30d37bfd (13 images, 6 GB card,
+    # process_res 504, K=5), mean pixels kept / seconds per window:
+    #   DA3-SMALL      19.4% / 0.43 s   137 MB   apache-2.0
+    #   DA3-BASE       31.1% / 0.68 s   542 MB   apache-2.0   <- shipped
+    #   DA3-LARGE-1.1  34.9% / 22.9 s  1644 MB   apache-2.0
+    # LARGE-1.1 wins on quality but is 34x slower for 3x the parameters
+    # because it thrashes a 6 GB card (peaked 5723/6144 MiB), leaving nothing
+    # for the trainer to coexist with. NOTE plain "DA3-LARGE" is CC-BY-NC;
+    # only the -1.1 refresh is Apache-2.0.
+    model_name: "depth-anything/DA3-BASE"
     device: "cuda"
     process_res: 504
     # Condition depth on the COLMAP intrinsics (FOV prior).
@@ -209,6 +216,132 @@ dense_init:
     # view. Only enable alongside a multi-view batch path.
     condition_extrinsics: false
     use_ray_pose: false
+    # Multi-view landmines (Plan 6a §8). DA3 defaults ref_view_strategy to
+    # "saddle_balanced", which reorders views; the window path keeps the
+    # anchor at index 0 and reads depths[0] back, so it must be "first".
+    ref_view_strategy: "first"
+    # Divide a window's translations by its own median camera-centre distance
+    # before handing poses to DA3, and undo it on the returned depth --
+    # api.py:333 clamps the median camera distance at 0.1 and COLMAP's scale
+    # is arbitrary.
+    prenormalize_extrinsics: true
+
+  # Plan 6a multi-view windows: each image anchors exactly ONE DA3 call over
+  # itself plus K covisible neighbours, and only pixels that several views
+  # agree on survive. Covisibility comes from COLMAP's tracks, so occluders
+  # are handled by construction. Only consulted when backend: da3.
+  multiview:
+    # ON. The window SELECTION half is measured on sessions/30d37bfd (13
+    # images): 36 edges over 12 usable images, no degenerate windows, and the
+    # one mis-registered image gated out. The DA3 multi-view CALL itself has
+    # still never been executed here -- §8's pre-normalisation and §9's
+    # residual behaviour remain predictions read off api.py. Every window that
+    # misbehaves falls back to the single-image path per image, so the blast
+    # radius of that being wrong is "dense-init is no better than before".
+    enabled: true
+
+    # --- window selection ---
+    # Neighbours per anchor; the window is K+1 views. Whether quality keeps
+    # climbing past 5 (to 8-12) is unmeasured -- cheap to sweep.
+    window_k: 5
+    # Below this many shared tracks there is not enough evidence of a shared
+    # surface to trust the pair.
+    min_shared_points: 30
+    # MVSNet's view-selection score (arXiv:1804.02505), re-centred from their
+    # DTU values (5/1/10) on measured phone capture. On sessions/30d37bfd the
+    # pairwise triangulation angle runs p25 14 deg, median 27 deg, max 57 deg,
+    # so a 5-8 deg peak made the score PREFER the most near-collinear pair
+    # available -- anchor img_0004 led its window with a 6 deg neighbour.
+    # Peaking at 20 deg demotes those to last without excluding them.
+    # Asymmetric on purpose: a near-collinear baseline is punished hard, a
+    # wide one gently. Re-measure for capture that is not a walk around a room.
+    theta0_deg: 20.0
+    sigma1_deg: 6.0
+    sigma2_deg: 15.0
+    # Views at very different distances resolve different spatial frequencies
+    # and drag the window's scale normalisation.
+    scale_ratio_min: 0.6
+    scale_ratio_max: 1.7
+    # Below this median triangulation angle the capture is a pure rotation
+    # (the user stood still and panned). Nothing can triangulate from it:
+    # the window is reported and the anchor falls back to monocular depth.
+    degenerate_angle_deg: 1.0
+    min_window_members: 3
+    # Floor on the diversity multiplier that spreads baselines around the
+    # anchor. Without it an exactly-collinear camera track (walking along a
+    # wall) collapses every window to two views: diversity should reorder
+    # candidates, never eliminate them.
+    diversity_floor: 0.05
+
+    # --- badly-registered-image gate ---
+    # DA3's Umeyama pose alignment only uses RANSAC at >= 10 views
+    # (api.py:341), so in a 6-view window ONE bad pose drags the whole
+    # window's scale. Gate hard.
+    min_track_observations: 20
+    # ...and relative to the session's own median observation count. This is
+    # the gate that actually catches the motivating case: img_0008 in
+    # sessions/30d37bfd (placed wildly wrong by the mapper in BOTH arms of
+    # Plan 4's A/B) sits at 0.29x the median while the next-weakest image is
+    # at 0.44x. Neither the absolute count nor the centre test separates them
+    # -- img_0008's camera centre is mid-pack among the 13. 0 disables it.
+    min_track_observations_frac: 0.35
+    # INERT on GLOMAP output: the incremental-GLOMAP path writes 0.0 as every
+    # point's reprojection error, so every image reads as perfect. This only
+    # bites on reconstructions from COLMAP's own bundle adjustment.
+    max_mean_reproj_error: 4.0
+    max_center_outlier_ratio: 6.0
+
+    # --- per-pixel cross-view consistency ---
+    # An anchor pixel survives only if this many neighbours agree on it after
+    # the reproject-and-return round trip. This count IS the frustum-
+    # intersection test, measured per pixel instead of derived as polyhedra.
+    reproj_px_threshold: 1.5
+    depth_rel_threshold: 0.01
+    n_consistent_min: 2
+
+    # --- per-window scale residual check (not optional) ---
+    # r = median(DA3_depth / SfM_depth) over the anchor's SfM points.
+    # Within tolerance: accept. Outside: apply the single scalar 1/r.
+    # Wild, or too few points to measure: reject the window and fall back.
+    residual_accept_tolerance: 0.03
+    residual_reject_low: 0.7
+    residual_reject_high: 1.3
+    residual_min_points: 8
+
+    # --- incremental alignment onto the existing dense cloud ---
+    # The fix for "pancaking" -- different windows placing the same surface at
+    # different depths, as parallel sheets. Measured on sessions/30d37bfd the
+    # windows disagree by a per-window AFFINE (scale + an origin offset of
+    # 2-3% of depth). The residual check above does NOT fix it: the sparse,
+    # texture-biased SfM points do not represent the dense surface, so they
+    # estimate a scale the dense pixels do not have. Instead, fit each new
+    # window onto the dense geometry the earlier images already built, down
+    # the new camera's own rays. DA3-BASE: median inter-window disagreement
+    # 1.45% -> 0.30%, sheet separation 0.223 -> 0.063 scene units.
+    align_to_reference_cloud: true
+    reference_min_correspondences: 500
+    reference_bin_px: 4
+    reference_huber_frac: 0.02
+    reference_iters: 4
+    reference_min_inlier_fraction: 0.5
+    reference_max_scale_dev: 0.25
+    reference_max_offset_frac: 0.15
+    # Sequential alignment CHAINS error -- each window inherits its
+    # predecessor's -- so absolute scale walks away from the camera poses even
+    # while neighbours agree. Measured -4.1% end-to-end over 13 images with no
+    # tether. This is a damped pull back to the SfM gauge, (1/r)**tether.
+    # 0.35 measured best: pancaking 0.30% -> 0.36%, drift -4.1% -> -2.2%.
+    # Raise it for long sessions, where the chain has more room to walk.
+    reference_sfm_tether: 0.35
+
+    # --- incremental refresh ---
+    # Stale anchors re-run per ingest. 0 because a refreshed anchor would
+    # APPEND a second copy of its points until Plan 6 A8 (replace-by-image)
+    # exists; the queue still accumulates and is reported.
+    refresh_budget_per_ingest: 0
+    # Camera-centre motion, as a fraction of scene scale, that invalidates
+    # every window containing that camera.
+    ba_motion_threshold: 0.01
 
   # Skip dense-init if the new image has fewer than this many SfM points
   # available for monocular-depth-to-SfM alignment.
@@ -239,11 +372,26 @@ dense_init:
   # prune. Raise if newcomers get pruned before they're observed enough.
   grace_iters: 20
 
+  # Park the splat model + Adam state in CPU RAM for the duration of the
+  # depth passes, so the depth network never shares the card with them.
+  # The serialized single-GPU cycle already keeps the trainer and COLMAP
+  # apart, but it did NOT cover this: pause -> to_cpu -> COLMAP -> resume ->
+  # to_cuda all happens BEFORE the ingest queue drains, so DA3 ran with the
+  # full model resident. Costs one CPU<->GPU round trip per ingest (seconds,
+  # against COLMAP's minutes) and reuses the same to_cpu/to_cuda pair as
+  # /pause, so the optimizer binding survives it.
+  free_gpu_for_depth: true
+
   # Cap on the viewer's lightweight dense preview cloud (dense.ply =
   # accumulated DA3 dense + current sparse points). Above this the dense
-  # points are uniformly subsampled so the cloud stays fast to fetch, kept
-  # separate from the heavy splat set (latest.ply). 0 disables the cap.
-  preview_max_points: 100000
+  # points are uniformly RANDOM-thinned, which drops real coverage and
+  # redundant points with equal probability. 0 = uncapped, and that is the
+  # default now: the old 100000 was an arbitrary figure with nothing behind
+  # it. dense.ply is a binary PLY at 15 bytes/point and grows by roughly
+  # 0.4 MB per ingested image (~27k surviving points), so a 13-image session
+  # is ~5 MB and a 50-image one ~20 MB. Set a number here if the viewer's
+  # fetch of /dense becomes the bottleneck.
+  preview_max_points: 0
 
   persist_model: false
 

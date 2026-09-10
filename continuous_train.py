@@ -22,6 +22,7 @@ from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass, field
 from pathlib import Path
 from random import randint
+from contextlib import contextmanager
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -35,9 +36,15 @@ from scene.progressive_scene import ProgressiveScene
 from scene.match_matrix import parse_match_matrix, compute_image_weights
 from scene.dense_init import (
     DepthAnythingV2Wrapper, DepthAnything3Wrapper, validate_alignment,
-    align_depth_to_sfm, depth_to_points,
+    align_depth_to_sfm, depth_to_points, depth_to_points_masked,
+    cross_view_consistency, window_scale_residual, resolve_scale_residual,
+    fit_depth_to_reference, ReferenceFit,
     transform_to_camera_frame, AlignmentFailed,
     DAv2Config, DA3Config, RansacConfig,
+)
+from scene.covisibility import (
+    MultiViewConfig, WindowRegistry, build_camera_records_from_scene,
+    build_covisibility_graph, registration_gate, select_window,
 )
 from scene.convergence import ConvergenceMonitor
 from scene.triggers import (
@@ -154,16 +161,25 @@ class DenseInitConfig:
     depth_disagreement_threshold: float = 0.10
     max_rejected_fraction: float = 0.5
     grace_iters: int = 20
+    # Move the splat model to CPU RAM around the depth passes, so the depth
+    # network never shares the card with it. Ignored when persist_model keeps
+    # a DAv2 handle resident (that path deliberately trades VRAM for latency).
+    free_gpu_for_depth: bool = True
     persist_model: bool = False
     # Cap on the viewer's lightweight dense preview cloud (dense.ply =
-    # accumulated DA3 dense + current sparse points). When the accumulated
-    # dense points exceed this, they're uniformly subsampled so the cloud
-    # stays small/fast to fetch (the heavy splat set lives in latest.ply).
-    # 0 disables the cap.
-    preview_max_points: int = 100_000
+    # accumulated DA3 dense + current sparse points). Above it the dense points
+    # are uniformly random-thinned. 0 disables the cap, which is now the
+    # default: the old 100k was an arbitrary number that discarded real
+    # coverage and redundant points with equal probability. dense.ply is a
+    # binary PLY at 15 bytes/point, so the file is ~0.4 MB per ingested image.
+    preview_max_points: int = 0
     dav2: DAv2Config = field(default_factory=DAv2Config)
     da3: DA3Config = field(default_factory=DA3Config)
     ransac: RansacConfig = field(default_factory=RansacConfig)
+    # Plan 6a multi-view windows. Only consulted when backend == "da3";
+    # disabled by default so the single-image path stays the operative one
+    # until the window path has been measured on a real session.
+    multiview: MultiViewConfig = field(default_factory=MultiViewConfig)
 
 
 @dataclass
@@ -227,6 +243,8 @@ def load_config(yaml_path: str) -> ContinuousConfig:
                 _apply_dict(cfg.dense_init.da3, v)
             elif k == "ransac":
                 _apply_dict(cfg.dense_init.ransac, v)
+            elif k == "multiview":
+                _apply_dict(cfg.dense_init.multiview, v)
             elif hasattr(cfg.dense_init, k):
                 setattr(cfg.dense_init, k, v)
 
@@ -351,21 +369,214 @@ def expand_gaussians_from_new_points(gaussians, prog_scene, new_point_mask, opt,
     gaussians.expand_from_pcd(pcd, novel_global, prog_scene.cameras_extent, birth_iter=birth_iter)
 
 
+def _resolve_cam_index(prog_scene, cam) -> Optional[int]:
+    """Index of `cam` in prog_scene.train_cameras, or None if it is unknown."""
+    idx = prog_scene._cam_name_to_idx.get(cam.image_name)
+    if idx is None:
+        idx = prog_scene._colmap_id_to_cam_idx.get(int(cam.colmap_id))
+    return idx
+
+
+def build_window_context(prog_scene, mv_cfg):
+    """Covisibility records + graph for the current snapshot (Plan 6a §2).
+
+    Returns (records, graph, excluded) or None when the snapshot has no
+    tracks to build a graph from — the caller then stays on the single-image
+    path rather than guessing at covisibility.
+    """
+    sfm_xyz = getattr(prog_scene, "_current_sfm_xyz", None)
+    if sfm_xyz is None or not len(sfm_xyz):
+        return None
+    records = build_camera_records_from_scene(prog_scene)
+    if not records:
+        return None
+    excluded = registration_gate(records, mv_cfg)
+    for idx, reason in excluded.items():
+        logger.info("[dense-init] window gate excludes %s: %s",
+                    records[idx].name, reason)
+    graph = build_covisibility_graph(records, sfm_xyz, mv_cfg, excluded)
+    if not graph:
+        return None
+    return records, graph, excluded
+
+
+def _run_window(depth_model, prog_scene, window, mv_cfg, dense_cfg,
+                scene_scale, reference_xyz=None):
+    """One DA3 multi-view pass for one anchor. Returns (xyz, rgb, weight).
+
+    Returns None when the window must fall back to the monocular path; the
+    reason is logged here.
+
+    Order is deliberate. The §6 consistency test is invariant to a uniform
+    scale on every depth map (pixel reprojection error and |d-z|/z both are),
+    but it is NOT invariant to an offset — so it runs on the raw window, and
+    the affine correction is applied afterwards to the anchor's own map, which
+    is the only one whose points we keep (§7).
+    """
+    cams = [prog_scene.train_cameras[m] for m in window.members]
+    anchor_cam = cams[0]
+    images = [c.original_image.cpu() for c in cams]
+
+    depths, confs = depth_model.predict_batch(images, cams)
+
+    # §6 — per-pixel agreement across the window. This is the frustum-
+    # intersection count, measured instead of derived.
+    n_consistent = cross_view_consistency(
+        depths, cams,
+        reproj_px_threshold=mv_cfg.reproj_px_threshold,
+        depth_rel_threshold=mv_cfg.depth_rel_threshold,
+    )
+    keep = n_consistent >= mv_cfg.n_consistent_min
+    if not keep.any():
+        logger.warning(
+            "[dense-init] %s: no pixel reached n_consistent >= %d across %d "
+            "views — dropping this window",
+            anchor_cam.image_name, mv_cfg.n_consistent_min, len(cams))
+        return None
+
+    anchor_depth = depths[0]
+    sfm_xyz_all, visible = prog_scene.get_sfm_points_visible_to(anchor_cam)
+    sfm_visible = sfm_xyz_all[visible]
+
+    # Preferred: put this window onto the dense geometry the earlier images
+    # already built, down this camera's own rays. Windows disagree by a
+    # per-window affine, and the SfM points are too sparse and too biased
+    # toward texture to estimate it (see fit_depth_to_reference).
+    fit = ReferenceFit()
+    if getattr(mv_cfg, "align_to_reference_cloud", False):
+        fit = fit_depth_to_reference(anchor_depth, anchor_cam, reference_xyz,
+                                     mv_cfg, valid_mask=keep)
+    if fit.ok:
+        anchor_depth = fit.apply(anchor_depth)
+        logger.info(
+            "[dense-init] %s: aligned to the existing cloud — scale %.4f, "
+            "offset %+.3f over %d cells (%.0f%% inliers)",
+            anchor_cam.image_name, fit.scale, fit.offset, fit.n_matched,
+            100 * fit.inlier_fraction)
+
+    # §9 — with an alignment in hand this is a GUARD, not the corrector: it
+    # catches a window that drifted away from SfM entirely. The first window
+    # has nothing to align to, and there §9 still sets absolute scale.
+    residual = resolve_scale_residual(
+        *window_scale_residual(anchor_depth, anchor_cam, sfm_visible), mv_cfg)
+    if residual.action == "reject":
+        logger.warning("[dense-init] %s: window rejected — %s",
+                       anchor_cam.image_name, residual.reason)
+        return None
+    tether = getattr(mv_cfg, "reference_sfm_tether", 0.0)
+    if fit.ok and tether > 0 and np.isfinite(residual.r) and residual.r > 0:
+        # Damped pull back to the SfM gauge. Without it the chain drifts:
+        # each window inherits its predecessor's scale error, so the cloud
+        # walks away from the camera poses it is being seeded against even
+        # while adjacent windows agree with each other.
+        tug = (1.0 / residual.r) ** tether
+        anchor_depth = anchor_depth * tug
+        if abs(tug - 1.0) > 0.002:
+            logger.info("[dense-init] %s: SfM tether x%.4f (r=%.3f)",
+                        anchor_cam.image_name, tug, residual.r)
+    elif residual.action == "rescale":
+        logger.info("[dense-init] %s: %s",
+                    anchor_cam.image_name, residual.reason)
+        anchor_depth = anchor_depth * residual.factor
+
+    # Confidence for the downstream voxel fusion (Plan 6 A7): DA3's own
+    # per-pixel conf times the agreement count.
+    weight = n_consistent.astype(np.float32)
+    if confs[0] is not None:
+        weight = weight * confs[0].numpy().astype(np.float32)
+
+    outcome = depth_to_points_masked(
+        anchor_depth, anchor_cam, keep, images[0],
+        target_n_points=dense_cfg.target_dense_points_per_image,
+        weights=weight,
+    )
+    if outcome is None:
+        return None
+
+    xyz, rgb, w = outcome
+    logger.info(
+        "[dense-init] %s: kept %d dense points from a %d-view window "
+        "(median angle %.1f deg, mean n_consistent %.2f, r=%.3f, %s)",
+        anchor_cam.image_name, len(xyz), len(cams), window.median_theta_deg,
+        float(weight[keep].mean()), residual.r,
+        "cloud-aligned" if fit.ok else f"no alignment: {fit.reason}")
+    return xyz, rgb, w
+
+@contextmanager
+def _gpu_freed_for_depth(gaussians, enabled: bool):
+    """Park the splat model in CPU RAM for the duration of the depth passes.
+
+    The serialized single-GPU design already keeps the trainer and COLMAP off
+    the card at the same time, but the DEPTH model was never covered: pause ->
+    to_cpu -> COLMAP -> resume -> to_cuda happens BEFORE the ingest queue is
+    drained, so DA3 used to run with the full model and Adam state resident.
+    On a 6 GB card that is the contention the design exists to avoid — DA3-BASE
+    is only 542 MB of weights, but its activations for a 6-view window at
+    process_res 504 land on top of whatever the splats already occupy.
+
+    Nothing inside the depth pass touches `gaussians`; only the seeding tail
+    does, and that runs after this context closes. The round trip reuses the
+    same to_cpu/to_cuda pair as /pause, so the optimizer binding survives it.
+    """
+    if not enabled or gaussians is None or not torch.cuda.is_available()             or not hasattr(gaussians, "to_cpu"):
+        yield
+        return
+
+    before = _cuda_memory_mb()
+    gaussians.to_cpu()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    freed = before - _cuda_memory_mb()
+    logger.info("[dense-init] splat model parked in CPU RAM for the depth "
+                "pass; freed %d MB VRAM", max(0, freed))
+    try:
+        yield
+    finally:
+        # Always bring it back: a failed depth pass must not leave the trainer
+        # unable to train.
+        gaussians.to_cuda()
+        torch.cuda.synchronize()
+
+
 # ---------------------------------------------------------------------------
 # Dense initialization for new images
 # ---------------------------------------------------------------------------
 
 def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
-                               opt, current_iter, dav2_model=None, max_gaussians=0):
+                               opt, current_iter, dav2_model=None,
+                               max_gaussians=0, window_registry=None,
+                               event_sink=None, reference_xyz=None):
+    """Seed Gaussians from monocular or multi-view depth for newly-ingested images.
+
+    Two paths:
+      single-image — DAv2/DA3 per image, affine-fitted to the SfM points.
+      multi-view windows (Plan 6a, dense_cfg.multiview.enabled) — each image
+        anchors exactly ONE DA3 call over itself plus K covisible neighbours,
+        so its depth map has exactly one scale fit and no internal seams. Only
+        pixels several views agree on survive.
+
+    `window_registry` carries window staleness across ingests (Plan 6a §10);
+    pass the same WindowRegistry each call. `event_sink(event, **fields)` is
+    called for capture problems the operator needs to see (§5.5).
+    `reference_xyz` is the dense cloud accumulated from the images already
+    ingested: each new window is fitted onto it (scale + offset) so its surface
+    lands on the one already there instead of a few percent behind it.
+    """
     import time
     t_start = time.monotonic()
     accumulated_xyz = []
     accumulated_rgb = []
     scene_scale = prog_scene.cameras_extent
     backend = getattr(dense_cfg, 'backend', 'dav2')
+    mv_cfg = getattr(dense_cfg, 'multiview', None)
+    use_windows = (backend == "da3" and mv_cfg is not None and mv_cfg.enabled)
     # Cameras whose DA3 fit failed the direct-depth sanity check; retried
     # with DAv2 after the DA3 context closes (never co-resident on GPU).
     fallback_cams = []
+
+    def _emit(event, **fields):
+        if event_sink is not None:
+            event_sink(event, **fields)
 
     def _run_cameras(depth_model, cams, model_backend):
         pass_camera = getattr(depth_model, 'accepts_camera', False)
@@ -424,13 +635,105 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
                 f"(a={result.a:.3f}, b={result.b:.3f}, inliers={result.n_inliers})"
             )
 
-    if backend == "da3":
+    def _run_windows(depth_model, registry, records, graph):
+        """Plan 6a §4 — one anchored window per image. Returns monocular leftovers."""
+        leftovers = []
+        # Grows as anchors land, so a later anchor in this same ingest aligns
+        # to an earlier one rather than waiting for the next snapshot.
+        reference = [reference_xyz] if reference_xyz is not None else []
+
+        new_indices = []
+        for cam in new_cams:
+            idx = _resolve_cam_index(prog_scene, cam)
+            if idx is None:
+                leftovers.append(cam)
+            else:
+                new_indices.append(idx)
+
+        # §10 step 4: bundle adjustment moving a camera invalidates its window
+        # and every window containing it.
+        moved = registry.mark_stale_for_moved_cameras(records, mv_cfg, scene_scale)
+        if moved:
+            logger.info("[dense-init] %d window(s) stale from camera motion",
+                        len(moved))
+        # §10 step 2: a newcomer can displace a neighbour in nearby windows.
+        for idx in new_indices:
+            registry.mark_stale_for_new_image(idx, records, graph, mv_cfg)
+
+        # §10 step 3: refresh stale anchors lazily, within the ingest budget.
+        refresh = registry.pop_stale(mv_cfg.refresh_budget_per_ingest)
+        if registry.stale:
+            logger.info("[dense-init] %d anchor(s) still queued for refresh",
+                        len(registry.stale))
+
+        for anchor in new_indices + refresh:
+            cam = prog_scene.train_cameras[anchor]
+            window = select_window(anchor, records, graph, mv_cfg)
+            registry.record(window, records)
+
+            if window.degenerate:
+                # §5.5 — report it, do not silently absorb it. Producing
+                # garbage for a pure-rotation capture is worse than saying
+                # "walk sideways".
+                logger.warning("[dense-init] %s: %s — falling back to "
+                               "monocular depth, points are low-confidence",
+                               cam.image_name, window.reason)
+                _emit("dense_window_degenerate", image_name=cam.image_name,
+                      reason=window.reason,
+                      median_angle_deg=round(window.median_theta_deg, 3),
+                      n_views=len(window.members))
+                leftovers.append(cam)
+                continue
+
+            try:
+                ref = (np.concatenate(reference, axis=0) if reference else None)
+                outcome = _run_window(depth_model, prog_scene, window, mv_cfg,
+                                      dense_cfg, scene_scale, reference_xyz=ref)
+            except Exception as e:  # a bad window must not kill the ingest
+                logger.warning("[dense-init] %s: window pass failed (%s); "
+                               "falling back to monocular depth",
+                               cam.image_name, e)
+                outcome = None
+
+            if outcome is None:
+                leftovers.append(cam)
+                continue
+
+            xyz, rgb, _weight = outcome
+            accumulated_xyz.append(xyz)
+            accumulated_rgb.append(rgb)
+            reference.append(xyz)
+
+        return leftovers
+
+    depth_phase = _gpu_freed_for_depth(
+        gaussians, getattr(dense_cfg, "free_gpu_for_depth", True)
+        and dav2_model is None)
+
+    # The dispatch below is indented one short step under `with`, the same
+    # trick the main loop uses under its `try`, so the diff stays readable
+    # instead of reflowing every line.
+    with depth_phase:
+     if backend == "da3":
         if dav2_model is not None:
             logger.warning(
                 "[dense-init] persist_model is only supported for the dav2 "
                 "backend; ignoring persistent handle for da3")
+        window_ctx = build_window_context(prog_scene, mv_cfg) if use_windows else None
+        if use_windows and window_ctx is None:
+            logger.info("[dense-init] no usable covisibility graph yet "
+                        "(cold start?) — using the single-image path")
         with DepthAnything3Wrapper(dense_cfg.da3) as depth_model:
-            _run_cameras(depth_model, new_cams, "da3")
+            if window_ctx is not None:
+                records, graph, _excluded = window_ctx
+                registry = window_registry if window_registry is not None \
+                    else WindowRegistry()
+                monocular_cams = _run_windows(depth_model, registry,
+                                              records, graph)
+                if monocular_cams:
+                    _run_cameras(depth_model, monocular_cams, "da3")
+            else:
+                _run_cameras(depth_model, new_cams, "da3")
         if fallback_cams and getattr(dense_cfg, 'da3_fallback_to_dav2', True):
             logger.warning(
                 f"[dense-init] retrying {len(fallback_cams)} image(s) with "
@@ -439,9 +742,9 @@ def dense_init_for_new_images(gaussians, prog_scene, new_cams, dense_cfg,
             fallback_cams.clear()
             with DepthAnythingV2Wrapper(dense_cfg.dav2) as depth_model:
                 _run_cameras(depth_model, retry, "dav2")
-    elif dav2_model is not None:
+     elif dav2_model is not None:
         _run_cameras(dav2_model, new_cams, "dav2")
-    else:
+     else:
         with DepthAnythingV2Wrapper(dense_cfg.dav2) as depth_model:
             _run_cameras(depth_model, new_cams, "dav2")
 
@@ -856,6 +1159,9 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                 "starting fresh")
 
     _persistent_dav2 = None
+    # Plan 6a §10: window staleness must survive across ingests, so the
+    # registry lives for the whole run rather than per dense-init call.
+    _window_registry = WindowRegistry()
     if cfg.dense_init.persist_model:
         if cfg.dense_init.backend == "da3":
             logger.warning(
@@ -952,6 +1258,9 @@ def continuous_training(dataset, opt, pipe, args, cfg: ContinuousConfig,
                     cfg.dense_init, opt, current_iter=global_iter,
                     dav2_model=_persistent_dav2,
                     max_gaussians=tc.num_max_ceiling,
+                    window_registry=_window_registry,
+                    event_sink=evlog.emit,
+                    reference_xyz=dense_cloud_xyz,
                 )
                 if seeded is not None:
                     accumulate_dense_points(*seeded)

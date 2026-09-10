@@ -377,3 +377,106 @@ def test_da3_predict_passes_extrinsics_when_enabled():
 def test_da3_predict_no_conditioning_passes_neither():
     kwargs = _predict_once(_di.DA3Config(conditioning=False))
     assert "intrinsics" not in kwargs and "extrinsics" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# The splat model must be off the card while the depth network is on it
+# ---------------------------------------------------------------------------
+
+class _OffloadRecordingGaussians(RecordingGaussians):
+    """Records where the model was when each depth call happened."""
+
+    def __init__(self):
+        super().__init__()
+        self.on_gpu = True
+        self.calls = []
+
+    def to_cpu(self):
+        self.on_gpu = False
+        self.calls.append("to_cpu")
+
+    def to_cuda(self):
+        self.on_gpu = True
+        self.calls.append("to_cuda")
+
+
+class _WatchingDepthModel(FakeDepthModel):
+    def __init__(self, gaussians, **kw):
+        super().__init__(**kw)
+        self._g = gaussians
+        self.seen_on_gpu = []
+
+    def predict(self, image_chw, camera=None):
+        self.seen_on_gpu.append(self._g.on_gpu)
+        return super().predict(image_chw, camera=camera)
+
+
+def _run_offload(ct, monkeypatch, enabled):
+    cam = small_cam()
+    scene = SyntheticScene(cam)
+    gaussians = _OffloadRecordingGaussians()
+    model = _WatchingDepthModel(gaussians, sign=+1.0, accepts_camera=True)
+
+    class FakeCtx:
+        def __enter__(self_inner):
+            return model
+
+        def __exit__(self_inner, *a):
+            return False
+
+    monkeypatch.setattr(ct, "DepthAnything3Wrapper", lambda cfg: FakeCtx())
+    cfg = _dense_cfg(ct, "da3", fallback=False)
+    cfg.free_gpu_for_depth = enabled
+    ct.dense_init_for_new_images(gaussians, scene, [cam], cfg, opt=None,
+                                 current_iter=0, max_gaussians=0)
+    return gaussians, model
+
+
+def test_depth_runs_with_the_splat_model_parked_in_cpu_ram(ct, monkeypatch):
+    """Plan: the serialized single-GPU cycle covers COLMAP but never covered
+    the depth net — it ran after resume, with the model already back on the
+    card."""
+    torch_cuda = __import__("torch").cuda.is_available()
+    gaussians, model = _run_offload(ct, monkeypatch, enabled=True)
+
+    assert model.seen_on_gpu, "the depth model should have been called"
+    if not torch_cuda:
+        # Without a card there is nothing to free; the context is a no-op.
+        assert gaussians.calls == []
+        return
+    assert all(seen is False for seen in model.seen_on_gpu),         "every depth call must happen with the splats off the GPU"
+    assert gaussians.calls == ["to_cpu", "to_cuda"]
+    assert gaussians.on_gpu, "the model must be back on the card afterwards"
+    # Seeding happens after the context closes, so it still sees a GPU model.
+    assert gaussians.expanded
+
+
+def test_the_offload_can_be_switched_off(ct, monkeypatch):
+    gaussians, model = _run_offload(ct, monkeypatch, enabled=False)
+    assert gaussians.calls == []
+    assert all(seen is True for seen in model.seen_on_gpu)
+
+
+def test_the_model_returns_to_the_gpu_even_when_depth_blows_up(ct, monkeypatch):
+    """A failed depth pass must not leave the trainer unable to train."""
+    import torch as _t
+    if not _t.cuda.is_available():
+        pytest.skip("no CUDA: the offload context is a no-op here")
+
+    gaussians = _OffloadRecordingGaussians()
+
+    class Boom:
+        def __enter__(self_inner):
+            raise RuntimeError("CUDA out of memory")
+
+        def __exit__(self_inner, *a):
+            return False
+
+    monkeypatch.setattr(ct, "DepthAnything3Wrapper", lambda cfg: Boom())
+    cfg = _dense_cfg(ct, "da3", fallback=False)
+    with pytest.raises(RuntimeError):
+        ct.dense_init_for_new_images(gaussians, SyntheticScene(small_cam()),
+                                     [small_cam()], cfg, opt=None,
+                                     current_iter=0, max_gaussians=0)
+    assert gaussians.calls == ["to_cpu", "to_cuda"]
+    assert gaussians.on_gpu
